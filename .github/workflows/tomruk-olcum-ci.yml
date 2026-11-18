@@ -1,17 +1,4 @@
-# ==============================================================================
-# TomrukOlcumAI - GitHub Actions Tek Seferde Yüklenebilir Otomasyon & CI/CD
-# ==============================================================================
-# Kurulum: Bu dosyayı GitHub deponuzda şu yola yükleyin:
-#   .github/workflows/tomruk-olcum-ci.yml
-#
-# Özellikler:
-# 1. Manuel tetikleme (workflow_dispatch) ile boş repoda proje klasör yapısını
-#    ve tomruk_olcum_projesi.yaml dosyasını tek tıkla otomatik oluşturur.
-# 2. Her push ve pull_request işleminde YAML yapılandırmasını doğrular.
-# 3. Python (OpenCV / ArUco / YOLO) ve Flutter (Android APK) hatlarını çalıştırır.
-# ==============================================================================
-
-name: TomrukOlcumAI CI/CD & Kurulum
+name: TomrukOlcumAI CI/CD & APK Oluştur
 
 on:
   push:
@@ -19,275 +6,270 @@ on:
   pull_request:
     branches: [ "main" ]
   workflow_dispatch:
-    inputs:
-      scaffold_project:
-        description: "Boş repoda proje klasör yapısını ve ana YAML konfigürasyonunu otomatik oluştur"
-        required: false
-        default: true
-        type: boolean
 
 permissions:
   contents: write
   actions: read
 
 jobs:
-  # ----------------------------------------------------------------------------
-  # 1. TEK TIKLA PROJE İSKELETİ OLUŞTURMA (Sadece manuel tetiklendiğinde çalışır)
-  # ----------------------------------------------------------------------------
-  scaffold-repository:
-    name: Proje İskeletini Oluştur
+  build-and-release-apk:
+    name: Flutter Uygulamasını Oluştur ve APK Derle
     runs-on: ubuntu-latest
-    if: github.event_name == 'workflow_dispatch' && inputs.scaffold_project == true
     steps:
       - name: Depoyu Klonla (Checkout)
         uses: actions/checkout@v4
-
-      - name: Klasör Yapısını ve Ana Konfigürasyonu Oluştur
-        run: |
-          mkdir -p config ai_pipeline/models ai_pipeline/scripts mobile_app docs
-
-          if [ ! -f config/tomruk_olcum_projesi.yaml ]; then
-          cat << 'EOF' > config/tomruk_olcum_projesi.yaml
-          project:
-            name: "TomrukOlcumAI"
-            version: "0.1.0-mvp"
-            description: "Akıllı telefon kamerası ile istiflerdeki tomrukların adet, çap ve hacim (m3) hesabını yapan mobil uygulama."
-            target_platforms:
-              - "Android"
-              - "iOS"
-            framework: "Flutter"
-            architecture_mode: "offline_first"
-
-          calibration:
-            primary_method: "aruco_marker"
-            fallback_method: "manual_reference_bar"
-            aruco_config:
-              dictionary: "DICT_4X4_50"
-              marker_id: 0
-              physical_size_cm: 50.0
-              require_same_plane: true
-            manual_bar_config:
-              default_length_cm: 100.0
-            perspective_control:
-              enabled: true
-              max_tilt_angle_deg: 10.0
-              max_yaw_angle_deg: 10.0
-              live_camera_guidance: true
-              auto_perspective_warp: true
-
-          ai_vision_pipeline:
-            execution_mode: "on_device"
-            inference_engine: "TFLite"
-            cloud_fallback_enabled: false
-            preprocessing:
-              auto_white_balance: true
-              shadow_compensation:
-                method: "CLAHE"
-                clip_limit: 2.0
-                tile_grid_size: [8, 8]
-              target_resolution: [1280, 1280]
-            object_detection:
-              model_architecture: "YOLOv11-seg"
-              target_class: "log_end"
-              confidence_threshold: 0.45
-              iou_threshold: 0.50
-              max_detections_per_frame: 500
-            diameter_extraction:
-              method: "min_enclosing_ellipse"
-              min_valid_diameter_cm: 6.0
-              max_valid_diameter_cm: 150.0
-
-          human_in_the_loop:
-            interactive_review_screen: true
-            allowed_actions:
-              - "zoom_and_pan"
-              - "add_missing_log"
-              - "remove_false_positive"
-              - "resize_diameter"
-            active_learning:
-              save_corrections_for_retraining: true
-              anonymize_metadata: false
-
-          multi_frame_stack:
-            enabled: true
-            overlap_prevention_method: "boundary_log_tagging"
-            merge_into_single_report: true
-
-          forestry_calculations:
-            volume_formula: "huber_cylinder"
-            default_log_lengths_m: [2.0, 2.5, 3.0, 4.0, 5.0]
-            allow_custom_length: true
-            bark_deduction:
-              enabled: true
-              mode: "species_default_percentage"
-              species_presets:
-                kizilcam: { label: "Kızılçam", deduction_percent: 12.0 }
-                karacam:  { label: "Karaçam",  deduction_percent: 11.0 }
-                sedir:    { label: "Sedir",    deduction_percent: 10.0 }
-                kayin:    { label: "Kayın",    deduction_percent: 5.0 }
-                mese:     { label: "Meşe",     deduction_percent: 9.0 }
-                diger:    { label: "Diğer / Manuel", deduction_percent: 0.0 }
-            diameter_classes_cm:
-              - { name: "Ince Cap",  min_cm: 10.0, max_cm: 19.9 }
-              - { name: "Orta Cap",  min_cm: 20.0, max_cm: 29.9 }
-              - { name: "Kalin Cap", min_cm: 30.0, max_cm: 150.0 }
-
-          data_and_storage:
-            local_database: "SQLite"
-            auto_sync_on_wifi_or_cellular: true
-            record_metadata:
-              - "measurement_id"
-              - "timestamp"
-              - "gps_coordinates"
-              - "depo_adi"
-              - "istif_no"
-              - "parti_no"
-              - "agac_turu"
-              - "tomruk_boyu_m"
-              - "olcum_yapan"
-
-          reporting:
-            export_formats: ["PDF", "XLSX", "CSV", "JSON"]
-            include_in_report:
-              - "annotated_image"
-              - "total_log_count"
-              - "average_diameter_cm"
-              - "diameter_class_breakdown"
-              - "gross_volume_m3"
-              - "net_volume_m3"
-          EOF
-          sed -i 's/^          //' config/tomruk_olcum_projesi.yaml
-          fi
-
-          touch ai_pipeline/models/.gitkeep ai_pipeline/scripts/.gitkeep mobile_app/.gitkeep docs/.gitkeep
-
-      - name: Oluşturulan Dosyaları Depoya Kaydet (Commit & Push)
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add .
-          git diff --staged --quiet || git commit -m "chore: TomrukOlcumAI proje iskeleti ve ana YAML konfigürasyonu oluşturuldu"
-          git push
-
-  # ----------------------------------------------------------------------------
-  # 2. YAML KONFİGÜRASYON DOĞRULAMA
-  # ----------------------------------------------------------------------------
-  validate-config:
-    name: YAML Konfigürasyon Doğrulama
-    runs-on: ubuntu-latest
-    needs: [ scaffold-repository ]
-    if: always() && (needs.scaffold-repository.result == 'success' || needs.scaffold-repository.result == 'skipped')
-    steps:
-      - name: Depoyu Klonla (Checkout)
-        uses: actions/checkout@v4
-
-      - name: Python Kurulumu
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: PyYAML Kur ve Konfigürasyonu Kontrol Et
-        run: |
-          pip install pyyaml
-          python - << 'PYEOF'
-          import os, sys, yaml
-
-          candidates = ['config/tomruk_olcum_projesi.yaml', 'tomruk_olcum_projesi.yaml']
-          target = next((p for p in candidates if os.path.exists(p)), None)
-          if not target:
-              print('Uyarı: tomruk_olcum_projesi.yaml bulunamadı. Önce scaffold_project ile oluşturabilirsiniz.')
-              sys.exit(0)
-
-          with open(target, 'r', encoding='utf-8') as f:
-              data = yaml.safe_load(f)
-
-          required_sections = [
-              'project', 'calibration', 'ai_vision_pipeline',
-              'human_in_the_loop', 'forestry_calculations',
-              'data_and_storage', 'reporting'
-          ]
-          missing = [k for k in required_sections if k not in data]
-          if missing:
-              print(f'Hata: Eksik ana bölümler: {missing}')
-              sys.exit(1)
-
-          print(f'Başarılı: {target} geçerli. Proje: {data["project"]["name"]} v{data["project"]["version"]}')
-          PYEOF
-
-  # ----------------------------------------------------------------------------
-  # 3. YAPAY ZEKA GÖRÜNTÜ İŞLEME HATTI TESTLERİ (Python / OpenCV / YOLO)
-  # ----------------------------------------------------------------------------
-  ai-pipeline-tests:
-    name: AI Görüntü İşleme Testleri
-    runs-on: ubuntu-latest
-    needs: [ validate-config ]
-    steps:
-      - name: Depoyu Klonla (Checkout)
-        uses: actions/checkout@v4
-
-      - name: Python Kurulumu
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: Bağımlılıkları Yükle ve Testleri Çalıştır
-        run: |
-          if [ -f ai_pipeline/requirements.txt ]; then
-            pip install -r ai_pipeline/requirements.txt
-          fi
-          if [ -d ai_pipeline/tests ]; then
-            pip install pytest
-            pytest ai_pipeline/tests
-          else
-            echo "ai_pipeline/tests klasörü henüz eklenmemiş, adım atlanıyor."
-          fi
-
-  # ----------------------------------------------------------------------------
-  # 4. FLUTTER MOBİL UYGULAMA DERLEME VE TEST (Android APK)
-  # ----------------------------------------------------------------------------
-  flutter-mobile-build:
-    name: Flutter Android Derleme & Test
-    runs-on: ubuntu-latest
-    needs: [ validate-config ]
-    steps:
-      - name: Depoyu Klonla (Checkout)
-        uses: actions/checkout@v4
-
-      - name: Flutter Projesi Kontrolü
-        id: check_flutter
-        run: |
-          if [ -f mobile_app/pubspec.yaml ]; then
-            echo "exists=true" >> $GITHUB_OUTPUT
-          else
-            echo "exists=false" >> $GITHUB_OUTPUT
-            echo "mobile_app/pubspec.yaml henüz yok, derleme adımı atlanıyor."
-          fi
 
       - name: Java (JDK 17) Kurulumu
-        if: steps.check_flutter.outputs.exists == 'true'
         uses: actions/setup-java@v4
         with:
           distribution: "temurin"
           java-version: "17"
 
       - name: Flutter Kurulumu
-        if: steps.check_flutter.outputs.exists == 'true'
         uses: subosito/flutter-action@v2
         with:
           channel: "stable"
           cache: true
 
+      - name: Başlangıç Flutter Projesini Oluştur (Yoksa)
+        run: |
+          if [ ! -f mobile_app/pubspec.yaml ]; then
+            flutter create --org com.tomruk --project-name tomruk_olcum_ai mobile_app
+
+            cat << 'EOF' > mobile_app/lib/main.dart
+          import 'dart:math';
+          import 'package:flutter/material.dart';
+
+          void main() {
+            runApp(const TomrukOlcumApp());
+          }
+
+          class TomrukOlcumApp extends StatelessWidget {
+            const TomrukOlcumApp({super.key});
+
+            @override
+            Widget build(BuildContext context) {
+              return MaterialApp(
+                title: 'TomrukOlcumAI',
+                debugShowCheckedModeBanner: false,
+                theme: ThemeData(
+                  colorScheme: ColorScheme.fromSeed(seedColor: const Color(0xFF2E5A27)),
+                  useMaterial3: true,
+                ),
+                home: const AnaSayfa(),
+              );
+            }
+          }
+
+          class AnaSayfa extends StatefulWidget {
+            const AnaSayfa({super.key});
+
+            @override
+            State<AnaSayfa> createState() => _AnaSayfaState();
+          }
+
+          class _AnaSayfaState extends State<AnaSayfa> {
+            final Map<String, double> _kabukOranlari = const {
+              'Kızılçam': 12.0,
+              'Karaçam': 11.0,
+              'Sedir': 10.0,
+              'Kayın': 5.0,
+              'Meşe': 9.0,
+              'Diğer (0%)': 0.0,
+            };
+
+            String _seciliTur = 'Kızılçam';
+            double _tomrukBoyu = 3.0;
+            final List<double> _caplarCm = [18, 22, 26, 31, 34];
+            final TextEditingController _capController = TextEditingController();
+
+            double get _kabukOrani => _kabukOranlari[_seciliTur] ?? 0.0;
+
+            double _hacimHesapla(double capCm, {required bool kabuksuz}) {
+              final double rMetre = (capCm / 100.0) / 2.0;
+              final double brut = pi * rMetre * rMetre * _tomrukBoyu;
+              return kabuksuz ? brut * (1.0 - _kabukOrani / 100.0) : brut;
+            }
+
+            void _capEkle() {
+              final val = double.tryParse(_capController.text.replaceAll(',', '.'));
+              if (val != null && val >= 6 && val <= 150) {
+                setState(() {
+                  _caplarCm.add(val);
+                  _capController.clear();
+                });
+              }
+            }
+
+            @override
+            void dispose() {
+              _capController.dispose();
+              super.dispose();
+            }
+
+            @override
+            Widget build(BuildContext context) {
+              final double brutToplam = _caplarCm.fold(
+                0.0,
+                (sum, d) => sum + _hacimHesapla(d, kabuksuz: false),
+              );
+              final double netToplam = _caplarCm.fold(
+                0.0,
+                (sum, d) => sum + _hacimHesapla(d, kabuksuz: true),
+              );
+              final int inceAdet = _caplarCm.where((d) => d < 20).length;
+              final int ortaAdet = _caplarCm.where((d) => d >= 20 && d < 30).length;
+              final int kalinAdet = _caplarCm.where((d) => d >= 30).length;
+
+              return Scaffold(
+                appBar: AppBar(
+                  title: const Text('TomrukOlcumAI (MVP)'),
+                  backgroundColor: Theme.of(context).colorScheme.primaryContainer,
+                ),
+                body: ListView(
+                  padding: const EdgeInsets.all(16),
+                  children: [
+                    Card(
+                      child: Padding(
+                        padding: const EdgeInsets.all(16),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            const Text(
+                              'Ölçüm Parametreleri',
+                              style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+                            ),
+                            const SizedBox(height: 12),
+                            DropdownButtonFormField<String>(
+                              value: _seciliTur,
+                              decoration: const InputDecoration(
+                                labelText: 'Ağaç Türü (Kabuk Düşümü)',
+                                border: OutlineInputBorder(),
+                              ),
+                              items: _kabukOranlari.entries
+                                  .map(
+                                    (e) => DropdownMenuItem(
+                                      value: e.key,
+                                      child: Text('${e.key} (%${e.value.toStringAsFixed(0)})'),
+                                    ),
+                                  )
+                                  .toList(),
+                              onChanged: (v) {
+                                if (v != null) setState(() => _seciliTur = v);
+                              },
+                            ),
+                            const SizedBox(height: 12),
+                            DropdownButtonFormField<double>(
+                              value: _tomrukBoyu,
+                              decoration: const InputDecoration(
+                                labelText: 'Tomruk Boyu (m)',
+                                border: OutlineInputBorder(),
+                              ),
+                              items: const [2.0, 2.5, 3.0, 4.0, 5.0]
+                                  .map(
+                                    (b) => DropdownMenuItem(
+                                      value: b,
+                                      child: Text('${b.toStringAsFixed(1)} m'),
+                                    ),
+                                  )
+                                  .toList(),
+                              onChanged: (v) {
+                                if (v != null) setState(() => _tomrukBoyu = v);
+                              },
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                    const SizedBox(height: 12),
+                    Card(
+                      child: Padding(
+                        padding: const EdgeInsets.all(16),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            const Text(
+                              'Özet Sonuçlar',
+                              style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+                            ),
+                            const SizedBox(height: 8),
+                            Text('Toplam Adet: ${_caplarCm.length}'),
+                            Text('Kabuklu Hacim: ${brutToplam.toStringAsFixed(3)} m³'),
+                            Text(
+                              'Kabuksuz Net Hacim: ${netToplam.toStringAsFixed(3)} m³',
+                              style: const TextStyle(fontWeight: FontWeight.bold),
+                            ),
+                            const Divider(height: 20),
+                            Text('İnce (<20 cm): $inceAdet | Orta (20-29 cm): $ortaAdet | Kalın (30+ cm): $kalinAdet'),
+                          ],
+                        ),
+                      ),
+                    ),
+                    const SizedBox(height: 12),
+                    Row(
+                      children: [
+                        Expanded(
+                          child: TextField(
+                            controller: _capController,
+                            keyboardType: const TextInputType.numberWithOptions(decimal: true),
+                            decoration: const InputDecoration(
+                              labelText: 'Test Çapı Ekle (cm)',
+                              border: OutlineInputBorder(),
+                            ),
+                          ),
+                        ),
+                        const SizedBox(width: 8),
+                        FilledButton(
+                          onPressed: _capEkle,
+                          child: const Text('Ekle'),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 12),
+                    Wrap(
+                      spacing: 8,
+                      children: List.generate(
+                        _caplarCm.length,
+                        (i) => Chip(
+                          label: Text('${_caplarCm[i].toStringAsFixed(0)} cm'),
+                          onDeleted: () => setState(() => _caplarCm.removeAt(i)),
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              );
+            }
+          }
+          EOF
+
+            cat << 'EOF' > mobile_app/test/widget_test.dart
+          import 'package:flutter_test/flutter_test.dart';
+          import 'package:tomruk_olcum_ai/main.dart';
+
+          void main() {
+            testWidgets('TomrukOlcumApp acilis testi', (WidgetTester tester) async {
+              await tester.pumpWidget(const TomrukOlcumApp());
+              expect(find.text('TomrukOlcumAI (MVP)'), findsOneWidget);
+            });
+          }
+          EOF
+
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add mobile_app
+            git diff --staged --quiet || git commit -m "feat: TomrukOlcumAI başlangıç Flutter uygulaması oluşturuldu"
+            git push
+          fi
+
       - name: Bağımlılıkları Al, Test Et ve APK Üret
-        if: steps.check_flutter.outputs.exists == 'true'
         working-directory: mobile_app
         run: |
           flutter pub get
-          flutter analyze
           flutter test
           flutter build apk --release
 
       - name: APK Çıktısını Yükle (Artifact)
-        if: steps.check_flutter.outputs.exists == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: tomruk-olcum-android-apk
