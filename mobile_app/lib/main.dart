@@ -27,9 +27,9 @@ class TomrukOlcumApp extends StatelessWidget {
 }
 
 class TespitEdilenTomruk {
-  final double xNorm; // 0.0 - 1.0
-  final double yNorm; // 0.0 - 1.0
-  final double capNorm; // Görüntü genişliğine göre oran
+  final double xNorm;
+  final double yNorm;
+  final double capNorm;
   double capCm;
 
   TespitEdilenTomruk({
@@ -57,7 +57,6 @@ class _KameraOlcumSayfasiState extends State<KameraOlcumSayfasi> {
   int _fotoYukseklik = 1;
   bool _isleniyor = false;
 
-  // Referans kalibrasyon (2 nokta, normalize 0..1)
   Offset? _refP1;
   Offset? _refP2;
   ReferansTipi _referansTipi = ReferansTipi.aruco50;
@@ -65,11 +64,9 @@ class _KameraOlcumSayfasiState extends State<KameraOlcumSayfasi> {
   final TextEditingController _bilinenCapController = TextEditingController(text: '28');
   double? _cmPerNormGenislik;
 
-  // Tespit edilen tomruklar
   final List<TespitEdilenTomruk> _tomruklar = [];
   EtkilesimModu _mod = EtkilesimModu.kalibrasyon;
 
-  // Ormancılık parametreleri
   final Map<String, double> _kabukOranlari = const {
     'Kızılçam': 12.0,
     'Karaçam': 11.0,
@@ -152,7 +149,6 @@ class _KameraOlcumSayfasiState extends State<KameraOlcumSayfasi> {
     });
   }
 
-  /// Fotoğrafta parlak/açık renkli dairesel tomruk kesitlerini otomatik tarar
   Future<void> _otomatikTespitCalistir() async {
     if (_seciliFoto == null) return;
     if (_cmPerNormGenislik == null) {
