@@ -39,7 +39,7 @@ jobs:
           cd mobile_app
           flutter pub add image_picker image
 
-      - name: Kameralı Ölçüm ve Tespit Kodunu Yaz
+      - name: Gelişmiş Kameralı Ölçüm ve Tespit Kodunu Yaz
         run: |
           cat << 'EOF' > mobile_app/lib/main.dart
           import 'dart:io';
@@ -73,7 +73,7 @@ jobs:
           class TespitEdilenTomruk {
             final double xNorm;
             final double yNorm;
-            final double capNorm;
+            double capNorm;
             double capCm;
 
             TespitEdilenTomruk({
@@ -84,7 +84,15 @@ jobs:
             });
           }
 
-          enum EtkilesimModu { kalibrasyon, tomrukEkle, tomrukSil }
+          class _AdayDaire {
+            final double x;
+            final double y;
+            final double r;
+            final double skor;
+            _AdayDaire(this.x, this.y, this.r, this.skor);
+          }
+
+          enum EtkilesimModu { kalibrasyon, secDuzenle, tomrukEkle }
           enum ReferansTipi { aruco50, cubuk100, bilinenTomrukCapi }
 
           class KameraOlcumSayfasi extends StatefulWidget {
@@ -96,6 +104,7 @@ jobs:
 
           class _KameraOlcumSayfasiState extends State<KameraOlcumSayfasi> {
             final ImagePicker _picker = ImagePicker();
+            final TransformationController _zoomController = TransformationController();
             File? _seciliFoto;
             int _fotoGenislik = 1;
             int _fotoYukseklik = 1;
@@ -103,12 +112,13 @@ jobs:
 
             Offset? _refP1;
             Offset? _refP2;
-            ReferansTipi _referansTipi = ReferansTipi.aruco50;
-            double _referansUzunlukCm = 50.0;
+            ReferansTipi _referansTipi = ReferansTipi.bilinenTomrukCapi;
+            double _referansUzunlukCm = 28.0;
             final TextEditingController _bilinenCapController = TextEditingController(text: '28');
             double? _cmPerNormGenislik;
 
             final List<TespitEdilenTomruk> _tomruklar = [];
+            int? _seciliTomrukIdx;
             EtkilesimModu _mod = EtkilesimModu.kalibrasyon;
 
             final Map<String, double> _kabukOranlari = const {
@@ -128,7 +138,12 @@ jobs:
             @override
             void dispose() {
               _bilinenCapController.dispose();
+              _zoomController.dispose();
               super.dispose();
+            }
+
+            void _zoomSifirla() {
+              _zoomController.value = Matrix4.identity();
             }
 
             void _referansTipiniGuncelle(ReferansTipi yeniTip) {
@@ -165,6 +180,7 @@ jobs:
               final bytes = await dosya.readAsBytes();
               final decoded = img.decodeImage(bytes);
 
+              _zoomSifirla();
               setState(() {
                 _seciliFoto = File(dosya.path);
                 _fotoGenislik = decoded?.width ?? 1;
@@ -173,6 +189,7 @@ jobs:
                 _refP2 = null;
                 _cmPerNormGenislik = null;
                 _tomruklar.clear();
+                _seciliTomrukIdx = null;
                 _mod = EtkilesimModu.kalibrasyon;
               });
             }
@@ -193,6 +210,7 @@ jobs:
               });
             }
 
+            /// Mesafe Dönüşümü (Distance Transform) + Çakışma Önleme (NMS) ile dairesel tomruk tespiti
             Future<void> _otomatikTespitCalistir() async {
               if (_seciliFoto == null) return;
               if (_cmPerNormGenislik == null) {
@@ -208,92 +226,149 @@ jobs:
                 return;
               }
 
-              setState(() => _isleniyor = true);
+              setState(() {
+                _isleniyor = true;
+                _seciliTomrukIdx = null;
+              });
 
               try {
                 final Uint8List bytes = await _seciliFoto!.readAsBytes();
                 final img.Image? orijinal = img.decodeImage(bytes);
                 if (orijinal == null) return;
 
-                const int analizW = 320;
-                final int analizH = max(1, (orijinal.height * analizW / orijinal.width).round());
-                final img.Image kucuk = img.copyResize(orijinal, width: analizW, height: analizH);
+                const int w = 360;
+                final int h = max(1, (orijinal.height * w / orijinal.width).round());
+                final img.Image kucuk = img.copyResize(orijinal, width: w, height: h);
 
-                final List<bool> mask = List<bool>.filled(analizW * analizH, false);
-                for (int y = 0; y < analizH; y++) {
-                  for (int x = 0; x < analizW; x++) {
+                // 1) Ahşap kesiti maskesi (gökyüzü, yeşil çim ve koyu gölgeleri ele)
+                final List<int> mask = List<int>.filled(w * h, 0);
+                for (int y = 0; y < h; y++) {
+                  for (int x = 0; x < w; x++) {
                     final p = kucuk.getPixel(x, y);
                     final r = p.r.toInt();
                     final g = p.g.toInt();
                     final b = p.b.toInt();
-                    final luma = (0.299 * r + 0.587 * g + 0.114 * b);
-                    final isWoodTone = luma > 95 && r >= b + 12 && r > 90 && g > 65;
-                    if (isWoodTone) {
-                      mask[y * analizW + x] = true;
+                    final luma = 0.299 * r + 0.587 * g + 0.114 * b;
+                    final isGreen = g > r + 6 && g > b + 6;
+                    final isSky = b > r + 5;
+                    final isWood = !isGreen && !isSky && luma > 80 && luma < 245 && r >= b + 12 && r > 85 && g > 55;
+                    if (isWood) {
+                      mask[y * w + x] = 1;
                     }
                   }
                 }
 
-                final List<bool> visited = List<bool>.filled(analizW * analizH, false);
-                final List<TespitEdilenTomruk> bulunanlar = [];
-                final List<int> queue = [];
+                // 2) 2-geçişli Chamfer Mesafe Dönüşümü (temas eden dairelerin merkez zirvelerini bulur)
+                final Float64List dist = Float64List(w * h);
+                const double inf = 1e6;
+                for (int i = 0; i < w * h; i++) {
+                  dist[i] = mask[i] == 1 ? inf : 0.0;
+                }
 
-                for (int y = 1; y < analizH - 1; y++) {
-                  for (int x = 1; x < analizW - 1; x++) {
-                    final idx = y * analizW + x;
-                    if (!mask[idx] || visited[idx]) continue;
+                for (int y = 1; y < h - 1; y++) {
+                  for (int x = 1; x < w - 1; x++) {
+                    final idx = y * w + x;
+                    if (dist[idx] == 0.0) continue;
+                    double d = dist[idx];
+                    d = min(d, dist[idx - 1] + 1.0);
+                    d = min(d, dist[idx - w] + 1.0);
+                    d = min(d, dist[idx - w - 1] + 1.414);
+                    d = min(d, dist[idx - w + 1] + 1.414);
+                    dist[idx] = d;
+                  }
+                }
 
-                    queue.clear();
-                    queue.add(idx);
-                    visited[idx] = true;
+                for (int y = h - 2; y >= 1; y--) {
+                  for (int x = w - 2; x >= 1; x--) {
+                    final idx = y * w + x;
+                    if (dist[idx] == 0.0) continue;
+                    double d = dist[idx];
+                    d = min(d, dist[idx + 1] + 1.0);
+                    d = min(d, dist[idx + w] + 1.0);
+                    d = min(d, dist[idx + w + 1] + 1.414);
+                    d = min(d, dist[idx + w - 1] + 1.414);
+                    dist[idx] = d;
+                  }
+                }
 
-                    int minX = x, maxX = x, minY = y, maxY = y;
-                    int alan = 0;
-                    int head = 0;
+                // 3) Yerel maksimumları (daire merkez adaylarını) topla
+                final double minR = max(3.5, (6.0 / _cmPerNormGenislik!) * w / 2.0);
+                final double maxR = min(w * 0.18, (120.0 / _cmPerNormGenislik!) * w / 2.0);
+                final List<_AdayDaire> adaylar = [];
 
-                    while (head < queue.length) {
-                      final curr = queue[head++];
-                      final cx = curr % analizW;
-                      final cy = curr ~/ analizW;
-                      alan++;
-                      if (cx < minX) minX = cx;
-                      if (cx > maxX) maxX = cx;
-                      if (cy < minY) minY = cy;
-                      if (cy > maxY) maxY = cy;
+                for (int y = 2; y < h - 2; y++) {
+                  for (int x = 2; x < w - 2; x++) {
+                    final val = dist[y * w + x];
+                    if (val < minR || val > maxR) continue;
 
-                      const dirs = [-1, 1, -analizW, analizW];
-                      for (final d in dirs) {
-                        final ni = curr + d;
-                        if (ni >= 0 && ni < mask.length && mask[ni] && !visited[ni]) {
-                          final nx = ni % analizW;
-                          if ((nx - cx).abs() <= 1) {
-                            visited[ni] = true;
-                            queue.add(ni);
+                    bool isPeak = true;
+                    for (int dy = -2; dy <= 2 && isPeak; dy++) {
+                      for (int dx = -2; dx <= 2; dx++) {
+                        if (dx == 0 && dy == 0) continue;
+                        if (dist[(y + dy) * w + (x + dx)] > val) {
+                          isPeak = false;
+                          break;
+                        }
+                      }
+                    }
+                    if (!isPeak) continue;
+
+                    // Daire içi doluluk (dairesellik) kontrolü
+                    final int ri = val.round();
+                    int toplam = 0;
+                    int dolu = 0;
+                    for (int dy = -ri; dy <= ri; dy += 2) {
+                      for (int dx = -ri; dx <= ri; dx += 2) {
+                        if (dx * dx + dy * dy <= ri * ri) {
+                          final nx = x + dx;
+                          final ny = y + dy;
+                          if (nx >= 0 && nx < w && ny >= 0 && ny < h) {
+                            toplam++;
+                            if (mask[ny * w + nx] == 1) dolu++;
                           }
                         }
                       }
                     }
-
-                    final bw = (maxX - minX + 1).toDouble();
-                    final bh = (maxY - minY + 1).toDouble();
-                    final oran = bw > bh ? bw / bh : bh / bw;
-                    final doluluk = alan / (bw * bh);
-
-                    if (alan >= 16 && alan <= 6000 && oran <= 1.75 && doluluk >= 0.42) {
-                      final capPx = (bw + bh) / 2.0;
-                      final capNorm = capPx / analizW;
-                      final capCm = capNorm * _cmPerNormGenislik!;
-                      if (capCm >= 6.0 && capCm <= 150.0) {
-                        bulunanlar.add(
-                          TespitEdilenTomruk(
-                            xNorm: ((minX + maxX) / 2.0) / analizW,
-                            yNorm: ((minY + maxY) / 2.0) / analizH,
-                            capNorm: capNorm,
-                            capCm: capCm,
-                          ),
-                        );
-                      }
+                    final doluluk = toplam > 0 ? dolu / toplam : 0.0;
+                    if (doluluk >= 0.68) {
+                      adaylar.add(_AdayDaire(x.toDouble(), y.toDouble(), val * 1.06, val * doluluk));
                     }
+                  }
+                }
+
+                // 4) Sıkı Çakışma Önleme (NMS): Üst üste binen daireleri engelle, sadece temas edenlere izin ver
+                adaylar.sort((a, b) => b.skor.compareTo(a.skor));
+                final List<_AdayDaire> secilenler = [];
+                for (final aday in adaylar) {
+                  bool cakisiyor = false;
+                  for (final s in secilenler) {
+                    final dx = aday.x - s.x;
+                    final dy = aday.y - s.y;
+                    final merkezMesafe = sqrt(dx * dx + dy * dy);
+                    // İki tomruk temas edebilir ama iç içe geçemez (%85 yarıçap toplamı kuralı)
+                    if (merkezMesafe < (aday.r + s.r) * 0.85) {
+                      cakisiyor = true;
+                      break;
+                    }
+                  }
+                  if (!cakisiyor) {
+                    secilenler.add(aday);
+                  }
+                }
+
+                final List<TespitEdilenTomruk> bulunanlar = [];
+                for (final s in secilenler) {
+                  final capNorm = (s.r * 2.0) / w;
+                  final capCm = capNorm * _cmPerNormGenislik!;
+                  if (capCm >= 6.0 && capCm <= 150.0) {
+                    bulunanlar.add(
+                      TespitEdilenTomruk(
+                        xNorm: s.x / w,
+                        yNorm: s.y / h,
+                        capNorm: capNorm,
+                        capCm: capCm,
+                      ),
+                    );
                   }
                 }
 
@@ -301,14 +376,14 @@ jobs:
                   _tomruklar
                     ..clear()
                     ..addAll(bulunanlar);
-                  _mod = EtkilesimModu.tomrukEkle;
+                  _mod = EtkilesimModu.secDuzenle;
                 });
 
                 if (mounted) {
                   ScaffoldMessenger.of(context).showSnackBar(
                     SnackBar(
                       content: Text(
-                        '${bulunanlar.length} adet aday tomruk tespit edildi. Fotoğrafa dokunarak ekleme/silme yapabilirsiniz.',
+                        '${bulunanlar.length} adet tomruk tespit edildi. Bir daireye dokunarak çapını ayarlayabilir veya silebilirsiniz.',
                       ),
                     ),
                   );
@@ -316,6 +391,18 @@ jobs:
               } finally {
                 if (mounted) setState(() => _isleniyor = false);
               }
+            }
+
+            void _seciliTomrukCapGuncelle(double yeniCapCm) {
+              if (_seciliTomrukIdx == null || _seciliTomrukIdx! >= _tomruklar.length) return;
+              final clamped = yeniCapCm.clamp(6.0, 150.0);
+              setState(() {
+                final t = _tomruklar[_seciliTomrukIdx!];
+                t.capCm = clamped;
+                if (_cmPerNormGenislik != null && _cmPerNormGenislik! > 0) {
+                  t.capNorm = clamped / _cmPerNormGenislik!;
+                }
+              });
             }
 
             void _fotoyaDokunuldu(TapDownDetails details, Size widgetSize) {
@@ -335,6 +422,19 @@ jobs:
                 if (_refP1 != null && _refP2 != null) {
                   _kalibrasyonuHesapla();
                 }
+              } else if (_mod == EtkilesimModu.secDuzenle) {
+                int? enYakinIdx;
+                double minMesafe = 0.08;
+                for (int i = 0; i < _tomruklar.length; i++) {
+                  final dx = _tomruklar[i].xNorm - nx;
+                  final dy = _tomruklar[i].yNorm - ny;
+                  final d = sqrt(dx * dx + dy * dy);
+                  if (d < minMesafe) {
+                    minMesafe = d;
+                    enYakinIdx = i;
+                  }
+                }
+                setState(() => _seciliTomrukIdx = enYakinIdx);
               } else if (_mod == EtkilesimModu.tomrukEkle) {
                 final capCm = _varsayilanManuelCapCm;
                 final capNorm = _cmPerNormGenislik != null ? capCm / _cmPerNormGenislik! : 0.06;
@@ -347,23 +447,8 @@ jobs:
                       capCm: capCm,
                     ),
                   );
+                  _seciliTomrukIdx = _tomruklar.length - 1;
                 });
-              } else if (_mod == EtkilesimModu.tomrukSil) {
-                if (_tomruklar.isEmpty) return;
-                int enYakinIdx = -1;
-                double minMesafe = 0.08;
-                for (int i = 0; i < _tomruklar.length; i++) {
-                  final dx = _tomruklar[i].xNorm - nx;
-                  final dy = _tomruklar[i].yNorm - ny;
-                  final d = sqrt(dx * dx + dy * dy);
-                  if (d < minMesafe) {
-                    minMesafe = d;
-                    enYakinIdx = i;
-                  }
-                }
-                if (enYakinIdx != -1) {
-                  setState(() => _tomruklar.removeAt(enYakinIdx));
-                }
               }
             }
 
@@ -380,11 +465,21 @@ jobs:
               final ince = _tomruklar.where((t) => t.capCm < 20).length;
               final orta = _tomruklar.where((t) => t.capCm >= 20 && t.capCm < 30).length;
               final kalin = _tomruklar.where((t) => t.capCm >= 30).length;
+              final seciliTomruk =
+                  (_seciliTomrukIdx != null && _seciliTomrukIdx! < _tomruklar.length) ? _tomruklar[_seciliTomrukIdx!] : null;
 
               return Scaffold(
                 appBar: AppBar(
                   title: const Text('TomrukOlcumAI - Kamera'),
                   backgroundColor: Theme.of(context).colorScheme.primaryContainer,
+                  actions: [
+                    if (_seciliFoto != null)
+                      IconButton(
+                        tooltip: 'Yakınlaştırmayı Sıfırla',
+                        icon: const Icon(Icons.zoom_out_map),
+                        onPressed: _zoomSifirla,
+                      ),
+                  ],
                 ),
                 body: ListView(
                   padding: const EdgeInsets.all(12),
@@ -416,40 +511,111 @@ jobs:
                           builder: (context, constraints) {
                             final aspect = _fotoGenislik / _fotoYukseklik;
                             final w = constraints.maxWidth;
-                            final h = w / aspect;
-                            return GestureDetector(
-                              onTapDown: (d) => _fotoyaDokunuldu(d, Size(w, h)),
-                              child: SizedBox(
-                                width: w,
-                                height: h,
-                                child: Stack(
-                                  fit: StackFit.expand,
-                                  children: [
-                                    Image.file(_seciliFoto!, fit: BoxFit.cover),
-                                    CustomPaint(
-                                      painter: _OlcumOverlayPainter(
-                                        refP1: _refP1,
-                                        refP2: _refP2,
-                                        tomruklar: _tomruklar,
-                                      ),
+                            final h = (w / aspect).clamp(220.0, 420.0);
+                            return SizedBox(
+                              width: w,
+                              height: h,
+                              child: InteractiveViewer(
+                                transformationController: _zoomController,
+                                minScale: 1.0,
+                                maxScale: 6.0,
+                                child: GestureDetector(
+                                  onTapDown: (d) => _fotoyaDokunuldu(d, Size(w, h)),
+                                  child: SizedBox(
+                                    width: w,
+                                    height: h,
+                                    child: Stack(
+                                      fit: StackFit.expand,
+                                      children: [
+                                        Image.file(_seciliFoto!, fit: BoxFit.fill),
+                                        CustomPaint(
+                                          painter: _OlcumOverlayPainter(
+                                            refP1: _refP1,
+                                            refP2: _refP2,
+                                            tomruklar: _tomruklar,
+                                            seciliIdx: _seciliTomrukIdx,
+                                          ),
+                                        ),
+                                      ],
                                     ),
-                                  ],
+                                  ),
                                 ),
                               ),
                             );
                           },
                         ),
                       ),
-                      const SizedBox(height: 8),
+                      const Padding(
+                        padding: EdgeInsets.only(top: 4, bottom: 8),
+                        child: Text(
+                          'İpucu: Hassas işaretleme için fotoğrafı iki parmakla yakınlaştırabilirsiniz.',
+                          style: TextStyle(fontSize: 12, color: Colors.black54),
+                          textAlign: TextAlign.center,
+                        ),
+                      ),
                       SegmentedButton<EtkilesimModu>(
                         segments: const [
                           ButtonSegment(value: EtkilesimModu.kalibrasyon, label: Text('1. Referans')),
-                          ButtonSegment(value: EtkilesimModu.tomrukEkle, label: Text('2. Ekle')),
-                          ButtonSegment(value: EtkilesimModu.tomrukSil, label: Text('3. Sil')),
+                          ButtonSegment(value: EtkilesimModu.secDuzenle, label: Text('2. Düzenle')),
+                          ButtonSegment(value: EtkilesimModu.tomrukEkle, label: Text('3. Ekle')),
                         ],
                         selected: {_mod},
                         onSelectionChanged: (s) => setState(() => _mod = s.first),
                       ),
+                      if (seciliTomruk != null) ...[
+                        const SizedBox(height: 8),
+                        Card(
+                          color: Theme.of(context).colorScheme.secondaryContainer,
+                          child: Padding(
+                            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                            child: Column(
+                              children: [
+                                Row(
+                                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                                  children: [
+                                    Text(
+                                      'Seçili Tomruk Çapı: ${seciliTomruk.capCm.toStringAsFixed(1)} cm',
+                                      style: const TextStyle(fontWeight: FontWeight.bold),
+                                    ),
+                                    IconButton(
+                                      tooltip: 'Bu Tomruğu Sil',
+                                      icon: const Icon(Icons.delete, color: Colors.red),
+                                      onPressed: () {
+                                        setState(() {
+                                          _tomruklar.removeAt(_seciliTomrukIdx!);
+                                          _seciliTomrukIdx = null;
+                                        });
+                                      },
+                                    ),
+                                  ],
+                                ),
+                                Row(
+                                  children: [
+                                    IconButton(
+                                      icon: const Icon(Icons.remove_circle_outline),
+                                      onPressed: () => _seciliTomrukCapGuncelle(seciliTomruk.capCm - 1.0),
+                                    ),
+                                    Expanded(
+                                      child: Slider(
+                                        value: seciliTomruk.capCm.clamp(6.0, 100.0),
+                                        min: 6.0,
+                                        max: 100.0,
+                                        divisions: 94,
+                                        label: '${seciliTomruk.capCm.round()} cm',
+                                        onChanged: _seciliTomrukCapGuncelle,
+                                      ),
+                                    ),
+                                    IconButton(
+                                      icon: const Icon(Icons.add_circle_outline),
+                                      onPressed: () => _seciliTomrukCapGuncelle(seciliTomruk.capCm + 1.0),
+                                    ),
+                                  ],
+                                ),
+                              ],
+                            ),
+                          ),
+                        ),
+                      ],
                       const SizedBox(height: 8),
                       Row(
                         children: [
@@ -462,12 +628,9 @@ jobs:
                                 isDense: true,
                               ),
                               items: const [
+                                DropdownMenuItem(value: ReferansTipi.bilinenTomrukCapi, child: Text('Bilinen Tomruk Çapı')),
                                 DropdownMenuItem(value: ReferansTipi.aruco50, child: Text('50 cm Levha')),
                                 DropdownMenuItem(value: ReferansTipi.cubuk100, child: Text('100 cm Çubuk')),
-                                DropdownMenuItem(
-                                  value: ReferansTipi.bilinenTomrukCapi,
-                                  child: Text('Bilinen Tomruk Çapı'),
-                                ),
                               ],
                               onChanged: (v) {
                                 if (v != null) _referansTipiniGuncelle(v);
@@ -495,7 +658,7 @@ jobs:
                           keyboardType: const TextInputType.numberWithOptions(decimal: true),
                           decoration: const InputDecoration(
                             labelText: 'Referans Tomruk Çapı (cm)',
-                            helperText: 'Çapını girdiğiniz tomruğun fotoğrafta iki karşı kenarına dokunun.',
+                            helperText: 'Fotoğrafı yakınlaştırıp çapını bildiğiniz tomruğun iki karşı kenarına dokunun.',
                             border: OutlineInputBorder(),
                             isDense: true,
                           ),
@@ -508,9 +671,9 @@ jobs:
                           padding: EdgeInsets.all(24),
                           child: Text(
                             'Başlamak için "Kamera ile Çek" veya "Galeriden Seç" butonuna basın.\n\n'
-                            '1) 50 cm levha, 100 cm çubuk veya çapını bildiğiniz herhangi bir tomruğun iki ucuna dokunarak kalibrasyon yapın.\n'
-                            '2) "Otomatik Say" ile tomruk adet ve çaplarını çıkarın.\n'
-                            '3) Eksik/fazla varsa dokunarak düzeltin.',
+                            '1) Fotoğrafı yakınlaştırıp referans tomruğun (veya levhanın) iki ucuna dokunun.\n'
+                            '2) "Otomatik Say" ile çakışmasız tomruk adet ve çaplarını çıkarın.\n'
+                            '3) Herhangi bir tomruğa dokunarak çapını ayarlayın veya silin.',
                             textAlign: TextAlign.center,
                           ),
                         ),
@@ -585,48 +748,52 @@ jobs:
             final Offset? refP1;
             final Offset? refP2;
             final List<TespitEdilenTomruk> tomruklar;
+            final int? seciliIdx;
 
             _OlcumOverlayPainter({
               required this.refP1,
               required this.refP2,
               required this.tomruklar,
+              required this.seciliIdx,
             });
 
             @override
             void paint(Canvas canvas, Size size) {
               final refPaint = Paint()
                 ..color = Colors.amber
-                ..strokeWidth = 3.0
+                ..strokeWidth = 2.5
                 ..style = PaintingStyle.stroke;
 
               if (refP1 != null) {
                 final p1 = Offset(refP1!.dx * size.width, refP1!.dy * size.height);
-                canvas.drawCircle(p1, 6, Paint()..color = Colors.amber);
+                canvas.drawCircle(p1, 5, Paint()..color = Colors.amber);
                 if (refP2 != null) {
                   final p2 = Offset(refP2!.dx * size.width, refP2!.dy * size.height);
-                  canvas.drawCircle(p2, 6, Paint()..color = Colors.amber);
+                  canvas.drawCircle(p2, 5, Paint()..color = Colors.amber);
                   canvas.drawLine(p1, p2, refPaint);
                 }
               }
 
-              final logPaint = Paint()
-                ..color = Colors.lightGreenAccent
-                ..strokeWidth = 2.0
-                ..style = PaintingStyle.stroke;
+              for (int i = 0; i < tomruklar.length; i++) {
+                final t = tomruklar[i];
+                final isSelected = i == seciliIdx;
+                final logPaint = Paint()
+                  ..color = isSelected ? Colors.cyanAccent : Colors.lightGreenAccent
+                  ..strokeWidth = isSelected ? 3.0 : 1.8
+                  ..style = PaintingStyle.stroke;
 
-              for (final t in tomruklar) {
                 final center = Offset(t.xNorm * size.width, t.yNorm * size.height);
-                final radius = max(8.0, (t.capNorm * size.width) / 2.0);
+                final radius = max(6.0, (t.capNorm * size.width) / 2.0);
                 canvas.drawCircle(center, radius, logPaint);
 
                 final tp = TextPainter(
                   text: TextSpan(
                     text: '${t.capCm.round()}',
-                    style: const TextStyle(
-                      color: Colors.white,
-                      fontSize: 10,
+                    style: TextStyle(
+                      color: isSelected ? Colors.black : Colors.white,
+                      fontSize: 9,
                       fontWeight: FontWeight.bold,
-                      backgroundColor: Colors.black54,
+                      backgroundColor: isSelected ? Colors.cyanAccent : Colors.black54,
                     ),
                   ),
                   textDirection: TextDirection.ltr,
@@ -657,7 +824,7 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add mobile_app
-          git diff --staged --quiet || git commit -m "feat: bilinen tomruk capi ve lintVital duzeltmesi eklendi"
+          git diff --staged --quiet || git commit -m "feat: yakinlastirma, cakismasiz dairesel tespit ve cap duzenleme eklendi"
           git push
 
       - name: Test Et ve APK Üret
