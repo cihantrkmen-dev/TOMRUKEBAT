@@ -82,6 +82,104 @@ class LisansServisi {
     }
     return false;
   }
+
+  /// Hem lisans ekranından hem ana ekrandan erişilebilen ortak Yönetici Lisans Paneli
+  static void yoneticiPaneliGoster(BuildContext context, {String varsayilanTalep = ''}) {
+    final sifreCtrl = TextEditingController();
+    final talepCtrl = TextEditingController(text: varsayilanTalep);
+    String? uretilenAnahtar;
+    bool yetkili = false;
+    String? sifreHata;
+
+    showDialog(
+      context: context,
+      builder: (ctx) {
+        return StatefulBuilder(
+          builder: (ctx, setModalState) {
+            return AlertDialog(
+              title: const Text('Yönetici Lisans Paneli'),
+              content: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  if (!yetkili) ...[
+                    TextField(
+                      controller: sifreCtrl,
+                      obscureText: true,
+                      decoration: InputDecoration(
+                        labelText: 'Yönetici Şifresi',
+                        errorText: sifreHata,
+                        border: const OutlineInputBorder(),
+                      ),
+                    ),
+                  ] else ...[
+                    TextField(
+                      controller: talepCtrl,
+                      textCapitalization: TextCapitalization.characters,
+                      decoration: const InputDecoration(
+                        labelText: 'Kullanıcı Talep Kodu (TALEP-XXXX)',
+                        border: OutlineInputBorder(),
+                      ),
+                    ),
+                    const SizedBox(height: 12),
+                    FilledButton(
+                      onPressed: () {
+                        if (talepCtrl.text.trim().isEmpty) return;
+                        setModalState(() {
+                          uretilenAnahtar = lisansAnahtariUret(talepCtrl.text);
+                        });
+                      },
+                      child: const Text('Lisans Anahtarı Üret'),
+                    ),
+                    if (uretilenAnahtar != null) ...[
+                      const SizedBox(height: 12),
+                      SelectableText(
+                        uretilenAnahtar!,
+                        style: const TextStyle(
+                          fontSize: 18,
+                          fontWeight: FontWeight.bold,
+                          color: Colors.green,
+                        ),
+                      ),
+                      TextButton.icon(
+                        icon: const Icon(Icons.copy),
+                        label: const Text('Kopyala'),
+                        onPressed: () {
+                          Clipboard.setData(ClipboardData(text: uretilenAnahtar!));
+                          ScaffoldMessenger.of(context).showSnackBar(
+                            const SnackBar(content: Text('Lisans anahtarı kopyalandı.')),
+                          );
+                        },
+                      ),
+                    ],
+                  ],
+                ],
+              ),
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.of(ctx).pop(),
+                  child: const Text('Kapat'),
+                ),
+                if (!yetkili)
+                  FilledButton(
+                    onPressed: () {
+                      if (yoneticiSifresiDogrula(sifreCtrl.text)) {
+                        setModalState(() {
+                          yetkili = true;
+                          sifreHata = null;
+                        });
+                      } else {
+                        setModalState(() => sifreHata = 'Hatalı yönetici şifresi');
+                      }
+                    },
+                    child: const Text('Giriş'),
+                  ),
+              ],
+            );
+          },
+        );
+      },
+    );
+  }
 }
 
 class TomrukOlcumApp extends StatelessWidget {
@@ -180,7 +278,7 @@ class _AcilisEkraniState extends State<AcilisEkrani> {
 }
 
 // ====================================================================
-// 3. ÇEVRİMDIŞI LİSANS VE GİZLİ YÖNETİCİ PANELİ
+// 3. ÇEVRİMDIŞI LİSANS EKRANI
 // ====================================================================
 class LisansEkrani extends StatefulWidget {
   const LisansEkrani({super.key});
@@ -223,101 +321,6 @@ class _LisansEkraniState extends State<LisansEkrani> {
     }
   }
 
-  void _yoneticiPaneliAc() {
-    final sifreCtrl = TextEditingController();
-    final talepCtrl = TextEditingController(text: _talepKodu);
-    String? uretilenAnahtar;
-    bool yetkili = false;
-    String? sifreHata;
-
-    showDialog(
-      context: context,
-      builder: (ctx) {
-        return StatefulBuilder(
-          builder: (ctx, setModalState) {
-            return AlertDialog(
-              title: const Text('Yönetici Lisans Paneli'),
-              content: Column(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  if (!yetkili) ...[
-                    TextField(
-                      controller: sifreCtrl,
-                      obscureText: true,
-                      decoration: InputDecoration(
-                        labelText: 'Yönetici Şifresi',
-                        errorText: sifreHata,
-                        border: const OutlineInputBorder(),
-                      ),
-                    ),
-                  ] else ...[
-                    TextField(
-                      controller: talepCtrl,
-                      decoration: const InputDecoration(
-                        labelText: 'Kullanıcı Talep Kodu (TALEP-XXXX)',
-                        border: OutlineInputBorder(),
-                      ),
-                    ),
-                    const SizedBox(height: 12),
-                    FilledButton(
-                      onPressed: () {
-                        setModalState(() {
-                          uretilenAnahtar = LisansServisi.lisansAnahtariUret(talepCtrl.text);
-                        });
-                      },
-                      child: const Text('Lisans Anahtarı Üret'),
-                    ),
-                    if (uretilenAnahtar != null) ...[
-                      const SizedBox(height: 12),
-                      SelectableText(
-                        uretilenAnahtar!,
-                        style: const TextStyle(
-                          fontSize: 18,
-                          fontWeight: FontWeight.bold,
-                          color: Colors.green,
-                        ),
-                      ),
-                      TextButton.icon(
-                        icon: const Icon(Icons.copy),
-                        label: const Text('Kopyala'),
-                        onPressed: () {
-                          Clipboard.setData(ClipboardData(text: uretilenAnahtar!));
-                          ScaffoldMessenger.of(context).showSnackBar(
-                            const SnackBar(content: Text('Lisans anahtarı kopyalandı.')),
-                          );
-                        },
-                      ),
-                    ],
-                  ],
-                ],
-              ),
-              actions: [
-                TextButton(
-                  onPressed: () => Navigator.of(ctx).pop(),
-                  child: const Text('Kapat'),
-                ),
-                if (!yetkili)
-                  FilledButton(
-                    onPressed: () {
-                      if (LisansServisi.yoneticiSifresiDogrula(sifreCtrl.text)) {
-                        setModalState(() {
-                          yetkili = true;
-                          sifreHata = null;
-                        });
-                      } else {
-                        setModalState(() => sifreHata = 'Hatalı yönetici şifresi');
-                      }
-                    },
-                    child: const Text('Giriş'),
-                  ),
-              ],
-            );
-          },
-        );
-      },
-    );
-  }
-
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -328,7 +331,10 @@ class _LisansEkraniState extends State<LisansEkrani> {
           IconButton(
             tooltip: 'Yönetici Paneli',
             icon: const Icon(Icons.admin_panel_settings),
-            onPressed: _yoneticiPaneliAc,
+            onPressed: () => LisansServisi.yoneticiPaneliGoster(
+              context,
+              varsayilanTalep: _talepKodu,
+            ),
           ),
         ],
       ),
@@ -941,7 +947,6 @@ class _KameraOlcumSayfasiState extends State<KameraOlcumSayfasi> {
     }
   }
 
-  /// Kabuksuz net hacim: Ondalık çaplar tam sayıya AŞAĞI yuvarlanarak (floor) hesaplanır
   double _netHacimHesapla(double capCm) {
     final int tamCapCm = capCm.floor();
     final rMetre = (tamCapCm / 100.0) / 2.0;
@@ -989,7 +994,10 @@ class _KameraOlcumSayfasiState extends State<KameraOlcumSayfasi> {
 
     return Scaffold(
       appBar: AppBar(
-        title: const Text('TomrukOlcumAI'),
+        title: GestureDetector(
+          onLongPress: () => LisansServisi.yoneticiPaneliGoster(context),
+          child: const Text('TomrukOlcumAI'),
+        ),
         backgroundColor: Theme.of(context).colorScheme.primaryContainer,
         actions: [
           if (_seciliFoto != null)
