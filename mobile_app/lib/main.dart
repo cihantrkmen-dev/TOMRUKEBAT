@@ -8,6 +8,7 @@ import 'package:flutter/services.dart';
 import 'package:image/image.dart' as img;
 import 'package:image_picker/image_picker.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:tflite_flutter/tflite_flutter.dart';
 
 void main() {
   runApp(const TomrukOlcumApp());
@@ -178,6 +179,104 @@ class LisansServisi {
   }
 }
 
+// ====================================================================
+// 2. ÇEVRİMDIŞI YOLO-TFLITE YAPAY ZEKA SERVİSİ
+// ====================================================================
+class _AdayDaire {
+  final double x; // 0..1 normalize
+  final double y; // 0..1 normalize
+  double r;       // genişlik normalize yarıçap
+  final double skor;
+  _AdayDaire(this.x, this.y, this.r, this.skor);
+}
+
+class YoloTfliteServisi {
+  Interpreter? _interpreter;
+  bool get aktif => _interpreter != null;
+
+  Future<bool> yukle() async {
+    try {
+      _interpreter = await Interpreter.fromAsset('assets/models/tomruk_model.tflite');
+      return true;
+    } catch (_) {
+      _interpreter = null;
+      return false;
+    }
+  }
+
+  void kapat() {
+    _interpreter?.close();
+    _interpreter = null;
+  }
+
+  /// Standart Ultralytics YOLOv8 TFLite (640x640 float32) çıkarımı
+  List<_AdayDaire> tespitEt(img.Image orijinal, {double confEsik = 0.25}) {
+    if (_interpreter == null) return [];
+    final inputShape = _interpreter!.getInputTensor(0).shape; // [1, H, W, 3]
+    final int inH = inputShape.length >= 3 ? inputShape[1] : 640;
+    final int inW = inputShape.length >= 3 ? inputShape[2] : 640;
+
+    final img.Image resized = img.copyResize(orijinal, width: inW, height: inH);
+    final input = List.generate(
+      1,
+      (_) => List.generate(
+        inH,
+        (y) => List.generate(
+          inW,
+          (x) {
+            final p = resized.getPixel(x, y);
+            return [p.r / 255.0, p.g / 255.0, p.b / 255.0];
+          },
+        ),
+      ),
+    );
+
+    final outShape = _interpreter!.getOutputTensor(0).shape;
+    // Genellikle [1, 4+nc, 8400] veya [1, 8400, 4+nc]
+    final int dim1 = outShape[1];
+    final int dim2 = outShape[2];
+    final output = List.generate(
+      1,
+      (_) => List.generate(dim1, (_) => List<double>.filled(dim2, 0.0)),
+    );
+
+    _interpreter!.run(input, output);
+
+    final List<_AdayDaire> adaylar = [];
+    final bool kanalOnce = dim1 < dim2; // [1, 5, 8400]
+    final int kutuSayisi = kanalOnce ? dim2 : dim1;
+    final int ozellikSayisi = kanalOnce ? dim1 : dim2;
+
+    for (int i = 0; i < kutuSayisi; i++) {
+      double maxConf = 0.0;
+      for (int c = 4; c < ozellikSayisi; c++) {
+        final double val = kanalOnce ? output[0][c][i] : output[0][i][c];
+        if (val > maxConf) maxConf = val;
+      }
+      if (maxConf < confEsik) continue;
+
+      double cx = kanalOnce ? output[0][0][i] : output[0][i][0];
+      double cy = kanalOnce ? output[0][1][i] : output[0][i][1];
+      double bw = kanalOnce ? output[0][2][i] : output[0][i][2];
+      double bh = kanalOnce ? output[0][3][i] : output[0][i][3];
+
+      // Piksel koordinatındaysa normalize et
+      if (cx > 2.0 || cy > 2.0 || bw > 2.0) {
+        cx /= inW;
+        cy /= inH;
+        bw /= inW;
+        bh /= inH;
+      }
+
+      final double rNorm = (bw + bh) / 4.0;
+      if (rNorm > 0.005 && rNorm < 0.35) {
+        adaylar.add(_AdayDaire(cx.clamp(0.0, 1.0), cy.clamp(0.0, 1.0), rNorm, maxConf));
+      }
+    }
+    return adaylar;
+  }
+}
+
 class TomrukOlcumApp extends StatelessWidget {
   const TomrukOlcumApp({super.key});
 
@@ -196,7 +295,7 @@ class TomrukOlcumApp extends StatelessWidget {
 }
 
 // ====================================================================
-// 2. AÇILIŞ EKRANI (SPLASH SCREEN)
+// 3. AÇILIŞ EKRANI (SPLASH SCREEN)
 // ====================================================================
 class AcilisEkrani extends StatefulWidget {
   const AcilisEkrani({super.key});
@@ -274,7 +373,7 @@ class _AcilisEkraniState extends State<AcilisEkrani> {
 }
 
 // ====================================================================
-// 3. ÇEVRİMDIŞI LİSANS EKRANI
+// 4. ÇEVRİMDIŞI LİSANS EKRANI
 // ====================================================================
 class LisansEkrani extends StatefulWidget {
   const LisansEkrani({super.key});
@@ -412,7 +511,7 @@ class _LisansEkraniState extends State<LisansEkrani> {
 }
 
 // ====================================================================
-// 4. HASSAS KABUKSUZ ÖLÇÜM MOTORU (ÇİFT REF + ROI + MORFOLOJİ)
+// 5. ANA ÖLÇÜM EKRANI (YOLO-TFLITE + ÇİFT REF + ROI + SIFIR ÇAKIŞMA)
 // ====================================================================
 class TespitEdilenTomruk {
   double xNorm;
@@ -428,14 +527,6 @@ class TespitEdilenTomruk {
   });
 }
 
-class _AdayDaire {
-  final double x;
-  final double y;
-  double r;
-  final double skor;
-  _AdayDaire(this.x, this.y, this.r, this.skor);
-}
-
 enum EtkilesimModu { ref1, ref2, roiAlani, secDuzenle, tomrukEkle }
 enum SeciliHedef { hicbiri, ref1, ref2, tomruk }
 
@@ -449,30 +540,29 @@ class KameraOlcumSayfasi extends StatefulWidget {
 class _KameraOlcumSayfasiState extends State<KameraOlcumSayfasi> {
   final ImagePicker _picker = ImagePicker();
   final TransformationController _zoomController = TransformationController();
+  final YoloTfliteServisi _yolo = YoloTfliteServisi();
+  bool _yoloHazir = false;
+
   File? _seciliFoto;
   int _fotoGenislik = 1;
   int _fotoYukseklik = 1;
   bool _isleniyor = false;
 
-  // Ref-1 (Kırmızı - Zorunlu)
   Offset? _ref1P1;
   Offset? _ref1Center;
   double? _ref1CapNorm;
   double _ref1CapCm = 25.0;
   final TextEditingController _ref1CapCtrl = TextEditingController(text: '25');
 
-  // Ref-2 (Turuncu - İsteğe Bağlı Perspektif Referansı)
   Offset? _ref2P1;
   Offset? _ref2Center;
   double? _ref2CapNorm;
   double _ref2CapCm = 25.0;
   final TextEditingController _ref2CapCtrl = TextEditingController(text: '25');
 
-  // İstif Çerçevesi (ROI - İsteğe Bağlı)
   Offset? _roiP1;
   Rect? _roiNorm;
 
-  // Tespit edilen tomruklar
   final List<TespitEdilenTomruk> _tomruklar = [];
   SeciliHedef _seciliHedef = SeciliHedef.hicbiri;
   int? _seciliTomrukIdx;
@@ -483,12 +573,27 @@ class _KameraOlcumSayfasiState extends State<KameraOlcumSayfasi> {
   final double _varsayilanManuelCapCm = 24.0;
 
   double get _invAspect => _fotoYukseklik / max(1, _fotoGenislik);
-
   bool get _ref1Hazir => _ref1Center != null && _ref1CapNorm != null && _ref1CapNorm! > 0.005;
   bool get _ref2Hazir => _ref2Center != null && _ref2CapNorm != null && _ref2CapNorm! > 0.005;
 
-  /// Verilen (xNorm, yNorm) konumundaki yerel ölçeği (cm / birim genişlik) hesaplar.
-  /// Ref-2 varsa iki referans arasında doğrusal perspektif interpolasyonu yapar.
+  @override
+  void initState() {
+    super.initState();
+    _yolo.yukle().then((ok) {
+      if (mounted) setState(() => _yoloHazir = ok);
+    });
+  }
+
+  @override
+  void dispose() {
+    _yolo.kapat();
+    _ref1CapCtrl.dispose();
+    _ref2CapCtrl.dispose();
+    _emvalBoyuController.dispose();
+    _zoomController.dispose();
+    super.dispose();
+  }
+
   double? _olcekHesapla(double xNorm, double yNorm) {
     if (!_ref1Hazir) return null;
     final double scale1 = _ref1CapCm / _ref1CapNorm!;
@@ -510,24 +615,11 @@ class _KameraOlcumSayfasiState extends State<KameraOlcumSayfasi> {
     if (!_ref1Hazir) return;
     for (final t in _tomruklar) {
       final sc = _olcekHesapla(t.xNorm, t.yNorm);
-      if (sc != null) {
-        t.capCm = t.capNorm * sc;
-      }
+      if (sc != null) t.capCm = t.capNorm * sc;
     }
   }
 
-  @override
-  void dispose() {
-    _ref1CapCtrl.dispose();
-    _ref2CapCtrl.dispose();
-    _emvalBoyuController.dispose();
-    _zoomController.dispose();
-    super.dispose();
-  }
-
-  void _zoomSifirla() {
-    _zoomController.value = Matrix4.identity();
-  }
+  void _zoomSifirla() => _zoomController.value = Matrix4.identity();
 
   void _emvalBoyuDegisti(String val) {
     final girilen = double.tryParse(val.replaceAll(',', '.'));
@@ -536,24 +628,17 @@ class _KameraOlcumSayfasiState extends State<KameraOlcumSayfasi> {
     }
   }
 
-  /// Hem tespit edilen tomruklarla hem de kilitli Ref-1 / Ref-2 çemberleriyle
-  /// kesin sıfır çakışma (teğet sınırı) kontrolü yapar.
   double _maksimumCakismasizYaricapNorm(double nx, double ny, {int? haricIdx}) {
     double maxR = 0.5;
-
     void kontrolEt(double ox, double oy, double oCapNorm) {
       final dx = nx - ox;
       final dy = (ny - oy) * _invAspect;
-      final merkezMesafe = sqrt(dx * dx + dy * dy);
-      final kalanBosluk = merkezMesafe - (oCapNorm / 2.0);
-      if (kalanBosluk < maxR) {
-        maxR = kalanBosluk;
-      }
+      final kalanBosluk = sqrt(dx * dx + dy * dy) - (oCapNorm / 2.0);
+      if (kalanBosluk < maxR) maxR = kalanBosluk;
     }
 
     if (_ref1Hazir) kontrolEt(_ref1Center!.dx, _ref1Center!.dy, _ref1CapNorm!);
     if (_ref2Hazir) kontrolEt(_ref2Center!.dx, _ref2Center!.dy, _ref2CapNorm!);
-
     for (int i = 0; i < _tomruklar.length; i++) {
       if (i == haricIdx) continue;
       kontrolEt(_tomruklar[i].xNorm, _tomruklar[i].yNorm, _tomruklar[i].capNorm);
@@ -592,7 +677,6 @@ class _KameraOlcumSayfasiState extends State<KameraOlcumSayfasi> {
     });
   }
 
-  /// 3x3 Morfolojik Kapama (Dilation + Erosion) ile tomruk içi çatlak ve etiketleri kapatır
   List<int> _morfolojikKapama(List<int> src, int w, int h) {
     final dilated = List<int>.filled(w * h, 0);
     for (int y = 1; y < h - 1; y++) {
@@ -627,6 +711,92 @@ class _KameraOlcumSayfasiState extends State<KameraOlcumSayfasi> {
     return closed;
   }
 
+  /// Yedek görüntü işleme motoru (tomruk_model.tflite yoksa devreye girer)
+  List<_AdayDaire> _yedekMotorTespit(img.Image orijinal, double minTargetCm, double maxTargetCm) {
+    const int w = 360;
+    final int h = max(1, (orijinal.height * w / orijinal.width).round());
+    final img.Image kucuk = img.copyResize(orijinal, width: w, height: h);
+
+    final int roiMinX = _roiNorm != null ? max(1, (_roiNorm!.left * w).floor()) : 1;
+    final int roiMaxX = _roiNorm != null ? min(w - 2, (_roiNorm!.right * w).ceil()) : w - 2;
+    final int roiMinY = _roiNorm != null ? max(1, (_roiNorm!.top * h).floor()) : 1;
+    final int roiMaxY = _roiNorm != null ? min(h - 2, (_roiNorm!.bottom * h).ceil()) : h - 2;
+
+    List<int> mask = List<int>.filled(w * h, 0);
+    for (int y = roiMinY; y <= roiMaxY; y++) {
+      for (int x = roiMinX; x <= roiMaxX; x++) {
+        final p = kucuk.getPixel(x, y);
+        final r = p.r.toDouble();
+        final g = p.g.toDouble();
+        final b = p.b.toDouble();
+        final luma = 0.299 * r + 0.587 * g + 0.114 * b;
+        final isGreen = g > r + 5 && g > b + 5;
+        final isSky = b > r + 4;
+        if (!isGreen && !isSky && r >= b + 6 && luma > 45 && luma < 245) {
+          mask[y * w + x] = 1;
+        }
+      }
+    }
+    mask = _morfolojikKapama(mask, w, h);
+
+    final Float64List dist = Float64List(w * h);
+    const double inf = 1e6;
+    for (int i = 0; i < w * h; i++) {
+      dist[i] = mask[i] == 1 ? inf : 0.0;
+    }
+    for (int y = 1; y < h - 1; y++) {
+      for (int x = 1; x < w - 1; x++) {
+        final idx = y * w + x;
+        if (dist[idx] == 0.0) continue;
+        double d = dist[idx];
+        d = min(d, dist[idx - 1] + 1.0);
+        d = min(d, dist[idx - w] + 1.0);
+        d = min(d, dist[idx - w - 1] + 1.414);
+        d = min(d, dist[idx - w + 1] + 1.414);
+        dist[idx] = d;
+      }
+    }
+    for (int y = h - 2; y >= 1; y--) {
+      for (int x = w - 2; x >= 1; x--) {
+        final idx = y * w + x;
+        if (dist[idx] == 0.0) continue;
+        double d = dist[idx];
+        d = min(d, dist[idx + 1] + 1.0);
+        d = min(d, dist[idx + w] + 1.0);
+        d = min(d, dist[idx + w + 1] + 1.414);
+        d = min(d, dist[idx + w - 1] + 1.414);
+        dist[idx] = d;
+      }
+    }
+
+    final List<_AdayDaire> adaylar = [];
+    for (int y = roiMinY + 2; y <= roiMaxY - 2; y++) {
+      for (int x = roiMinX + 2; x <= roiMaxX - 2; x++) {
+        final val = dist[y * w + x];
+        if (val < 3.5) continue;
+        final sc = _olcekHesapla(x / w, y / h)!;
+        final localMinR = (minTargetCm / sc) * w / 2.0;
+        final localMaxR = (maxTargetCm / sc) * w / 2.0;
+        if (val < localMinR || val > localMaxR) continue;
+
+        bool isPeak = true;
+        for (int dy = -2; dy <= 2 && isPeak; dy++) {
+          for (int dx = -2; dx <= 2; dx++) {
+            if (dx == 0 && dy == 0) continue;
+            if (dist[(y + dy) * w + (x + dx)] > val) {
+              isPeak = false;
+              break;
+            }
+          }
+        }
+        if (isPeak) {
+          adaylar.add(_AdayDaire(x / w, y / h, (val * 1.05) / w, val));
+        }
+      }
+    }
+    return adaylar;
+  }
+
   Future<void> _otomatikTespitCalistir() async {
     if (_seciliFoto == null) return;
     if (!_ref1Hazir) {
@@ -649,181 +819,43 @@ class _KameraOlcumSayfasiState extends State<KameraOlcumSayfasi> {
       final img.Image? orijinal = img.decodeImage(bytes);
       if (orijinal == null) return;
 
-      const int w = 360;
-      final int h = max(1, (orijinal.height * w / orijinal.width).round());
-      final img.Image kucuk = img.copyResize(orijinal, width: w, height: h);
-
-      // 1) Ref-1 çemberi içinden gerçek ahşap renk profili öğren
-      double sumR = 0, sumG = 0, sumB = 0;
-      int sampleCount = 0;
-      final double r1cx = _ref1Center!.dx * w;
-      final double r1cy = _ref1Center!.dy * h;
-      final double r1rad = (_ref1CapNorm! * w) * 0.38; // İç %75 bölge
-
-      for (int y = max(0, (r1cy - r1rad).floor()); y <= min(h - 1, (r1cy + r1rad).ceil()); y++) {
-        for (int x = max(0, (r1cx - r1rad).floor()); x <= min(w - 1, (r1cx + r1rad).ceil()); x++) {
-          final dx = x - r1cx;
-          final dy = y - r1cy;
-          if (dx * dx + dy * dy <= r1rad * r1rad) {
-            final p = kucuk.getPixel(x, y);
-            sumR += p.r.toDouble();
-            sumG += p.g.toDouble();
-            sumB += p.b.toDouble();
-            sampleCount++;
-          }
-        }
-      }
-
-      final double meanR = sampleCount > 0 ? sumR / sampleCount : 155.0;
-      final double meanG = sampleCount > 0 ? sumG / sampleCount : 115.0;
-      final double meanB = sampleCount > 0 ? sumB / sampleCount : 80.0;
-      final double meanLuma = 0.299 * meanR + 0.587 * meanG + 0.114 * meanB;
-
-      // ROI sınırları (varsa sadece çerçeve içi taranır)
-      final int roiMinX = _roiNorm != null ? max(1, (_roiNorm!.left * w).floor()) : 1;
-      final int roiMaxX = _roiNorm != null ? min(w - 2, (_roiNorm!.right * w).ceil()) : w - 2;
-      final int roiMinY = _roiNorm != null ? max(1, (_roiNorm!.top * h).floor()) : 1;
-      final int roiMaxY = _roiNorm != null ? min(h - 2, (_roiNorm!.bottom * h).ceil()) : h - 2;
-
-      // 2) Referans renk profiline dayalı ahşap maskesi
-      List<int> mask = List<int>.filled(w * h, 0);
-      for (int y = roiMinY; y <= roiMaxY; y++) {
-        for (int x = roiMinX; x <= roiMaxX; x++) {
-          final p = kucuk.getPixel(x, y);
-          final r = p.r.toDouble();
-          final g = p.g.toDouble();
-          final b = p.b.toDouble();
-          final luma = 0.299 * r + 0.587 * g + 0.114 * b;
-
-          final isGreen = g > r + 5 && g > b + 5;
-          final isSky = b > r + 4;
-          final isWarmWood = r >= b + 8;
-
-          // Referans tomruk rengine yakınlık (parlaklık ve ton toleransı)
-          final colorDist = sqrt(
-            pow(r - meanR, 2) + pow(g - meanG, 2) + pow(b - meanB, 2),
-          );
-          final lumaOk = luma > max(65.0, meanLuma - 75.0) && luma < min(245.0, meanLuma + 75.0);
-
-          if (!isGreen && !isSky && isWarmWood && lumaOk && colorDist < 115.0) {
-            mask[y * w + x] = 1;
-          }
-        }
-      }
-
-      // 3) Morfolojik Kapama (çatlak, koyu öz ve barkod etiketlerini birleştir)
-      mask = _morfolojikKapama(mask, w, h);
-
-      // 4) Chamfer Mesafe Dönüşümü
-      final Float64List dist = Float64List(w * h);
-      const double inf = 1e6;
-      for (int i = 0; i < w * h; i++) {
-        dist[i] = mask[i] == 1 ? inf : 0.0;
-      }
-
-      for (int y = 1; y < h - 1; y++) {
-        for (int x = 1; x < w - 1; x++) {
-          final idx = y * w + x;
-          if (dist[idx] == 0.0) continue;
-          double d = dist[idx];
-          d = min(d, dist[idx - 1] + 1.0);
-          d = min(d, dist[idx - w] + 1.0);
-          d = min(d, dist[idx - w - 1] + 1.414);
-          d = min(d, dist[idx - w + 1] + 1.414);
-          dist[idx] = d;
-        }
-      }
-
-      for (int y = h - 2; y >= 1; y--) {
-        for (int x = w - 2; x >= 1; x--) {
-          final idx = y * w + x;
-          if (dist[idx] == 0.0) continue;
-          double d = dist[idx];
-          d = min(d, dist[idx + 1] + 1.0);
-          d = min(d, dist[idx + w] + 1.0);
-          d = min(d, dist[idx + w + 1] + 1.414);
-          d = min(d, dist[idx + w - 1] + 1.414);
-          dist[idx] = d;
-        }
-      }
-
-      // 5) Akıllı Çap Bandı: Referans çapın %55 - %165 aralığı (parazit küçük daireleri engeller)
       final double refMinCm = _ref2Hazir ? min(_ref1CapCm, _ref2CapCm) : _ref1CapCm;
       final double refMaxCm = _ref2Hazir ? max(_ref1CapCm, _ref2CapCm) : _ref1CapCm;
-      final double minTargetCm = max(8.0, refMinCm * 0.55);
-      final double maxTargetCm = min(150.0, refMaxCm * 1.65);
+      final double minTargetCm = max(8.0, refMinCm * 0.40);
+      final double maxTargetCm = min(150.0, refMaxCm * 1.75);
 
-      final List<_AdayDaire> adaylar = [];
+      // 1) Öncelik: Açık kaynak YOLO-TFLite modeli; yoksa yedek motor
+      List<_AdayDaire> hamAdaylar = _yolo.aktif
+          ? _yolo.tespitEt(orijinal, confEsik: 0.25)
+          : _yedekMotorTespit(orijinal, minTargetCm, maxTargetCm);
 
-      for (int y = roiMinY + 2; y <= roiMaxY - 2; y++) {
-        for (int x = roiMinX + 2; x <= roiMaxX - 2; x++) {
-          final val = dist[y * w + x];
-          if (val < 3.5) continue;
-
-          final localScale = _olcekHesapla(x / w, y / h)!;
-          final double localMinR = (minTargetCm / localScale) * w / 2.0;
-          final double localMaxR = (maxTargetCm / localScale) * w / 2.0;
-          if (val < localMinR || val > localMaxR) continue;
-
-          bool isPeak = true;
-          for (int dy = -2; dy <= 2 && isPeak; dy++) {
-            for (int dx = -2; dx <= 2; dx++) {
-              if (dx == 0 && dy == 0) continue;
-              if (dist[(y + dy) * w + (x + dx)] > val) {
-                isPeak = false;
-                break;
-              }
-            }
-          }
-          if (!isPeak) continue;
-
-          final int ri = val.round();
-          int toplam = 0;
-          int dolu = 0;
-          for (int dy = -ri; dy <= ri; dy += 2) {
-            for (int dx = -ri; dx <= ri; dx += 2) {
-              if (dx * dx + dy * dy <= ri * ri) {
-                final nx = x + dx;
-                final ny = y + dy;
-                if (nx >= 0 && nx < w && ny >= 0 && ny < h) {
-                  toplam++;
-                  if (mask[ny * w + nx] == 1) dolu++;
-                }
-              }
-            }
-          }
-          final doluluk = toplam > 0 ? dolu / toplam : 0.0;
-          if (doluluk >= 0.70) {
-            adaylar.add(_AdayDaire(x.toDouble(), y.toDouble(), val * 1.05, val * doluluk));
-          }
-        }
+      // 2) ROI (Alan) filtresi
+      if (_roiNorm != null) {
+        hamAdaylar = hamAdaylar
+            .where((a) => _roiNorm!.contains(Offset(a.x, a.y)))
+            .toList();
       }
 
-      // 6) Kilitli Referans Alanları + Kesin Sıfır Çakışma (d >= r1 + r2)
-      adaylar.sort((a, b) => b.skor.compareTo(a.skor));
+      // 3) Kilitli Referans Alanları + Kesin Sıfır Çakışma (d >= r1 + r2)
+      hamAdaylar.sort((a, b) => b.skor.compareTo(a.skor));
       final List<_AdayDaire> kilitliler = [
-        _AdayDaire(_ref1Center!.dx * w, _ref1Center!.dy * h, (_ref1CapNorm! * w) / 2.0, 1e9),
+        _AdayDaire(_ref1Center!.dx, _ref1Center!.dy, _ref1CapNorm! / 2.0, 1e9),
       ];
       if (_ref2Hazir) {
-        kilitliler.add(
-          _AdayDaire(_ref2Center!.dx * w, _ref2Center!.dy * h, (_ref2CapNorm! * w) / 2.0, 1e9),
-        );
+        kilitliler.add(_AdayDaire(_ref2Center!.dx, _ref2Center!.dy, _ref2CapNorm! / 2.0, 1e9));
       }
 
       final List<_AdayDaire> secilenler = [];
-      for (final aday in adaylar) {
-        final localScale = _olcekHesapla(aday.x / w, aday.y / h)!;
-        final double localMinR = (minTargetCm / localScale) * w / 2.0;
-
+      for (final aday in hamAdaylar) {
+        final sc = _olcekHesapla(aday.x, aday.y)!;
+        final double localMinR = (minTargetCm / sc) / 2.0;
         double izinVerilenMaxR = aday.r;
         bool gecersiz = false;
 
         for (final s in [...kilitliler, ...secilenler]) {
           final dx = aday.x - s.x;
-          final dy = aday.y - s.y;
-          final merkezMesafe = sqrt(dx * dx + dy * dy);
-          final kalanBosluk = merkezMesafe - s.r;
-
+          final dy = (aday.y - s.y) * _invAspect;
+          final kalanBosluk = sqrt(dx * dx + dy * dy) - s.r;
           if (kalanBosluk < localMinR) {
             gecersiz = true;
             break;
@@ -841,16 +873,13 @@ class _KameraOlcumSayfasiState extends State<KameraOlcumSayfasi> {
 
       final List<TespitEdilenTomruk> bulunanlar = [];
       for (final s in secilenler) {
-        final xN = s.x / w;
-        final yN = s.y / h;
-        final capNorm = (s.r * 2.0) / w;
-        final localScale = _olcekHesapla(xN, yN)!;
-        final capCm = capNorm * localScale;
+        final capNorm = s.r * 2.0;
+        final capCm = capNorm * _olcekHesapla(s.x, s.y)!;
         if (capCm >= minTargetCm && capCm <= maxTargetCm) {
           bulunanlar.add(
             TespitEdilenTomruk(
-              xNorm: xN,
-              yNorm: yN,
+              xNorm: s.x,
+              yNorm: s.y,
               capNorm: capNorm,
               capCm: capCm,
             ),
@@ -866,11 +895,12 @@ class _KameraOlcumSayfasiState extends State<KameraOlcumSayfasi> {
       });
 
       if (mounted) {
+        final motorAdi = _yolo.aktif ? 'YOLO-TFLite AI' : 'Yedek Motor';
         final int refAdet = (_ref1Hazir ? 1 : 0) + (_ref2Hazir ? 1 : 0);
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
             content: Text(
-              '${bulunanlar.length} adet yeni + $refAdet referans = ${bulunanlar.length + refAdet} tomruk tespit edildi.',
+              '[$motorAdi] ${bulunanlar.length} yeni + $refAdet referans = ${bulunanlar.length + refAdet} tomruk.',
             ),
           ),
         );
@@ -1084,7 +1114,6 @@ class _KameraOlcumSayfasiState extends State<KameraOlcumSayfasi> {
 
   @override
   Widget build(BuildContext context) {
-    // Referans tomrukları da toplam adet ve hacme dahil et
     final List<double> tumCaplar = [
       if (_ref1Hazir) _ref1CapCm,
       if (_ref2Hazir) _ref2CapCm,
@@ -1105,7 +1134,16 @@ class _KameraOlcumSayfasiState extends State<KameraOlcumSayfasi> {
       appBar: AppBar(
         title: GestureDetector(
           onLongPress: () => LisansServisi.yoneticiPaneliGoster(context),
-          child: const Text('TomrukOlcumAI'),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text('TomrukOlcumAI', style: TextStyle(fontSize: 18)),
+              Text(
+                _yoloHazir ? 'Motor: YOLO-TFLite AI (Aktif)' : 'Motor: Yedek (Model Bekleniyor)',
+                style: const TextStyle(fontSize: 11),
+              ),
+            ],
+          ),
         ),
         backgroundColor: Theme.of(context).colorScheme.primaryContainer,
         actions: [
@@ -1213,7 +1251,6 @@ class _KameraOlcumSayfasiState extends State<KameraOlcumSayfasi> {
                 onSelectionChanged: (s) => setState(() => _mod = s.first),
               ),
             ),
-            // Ref-1 İnce Ayar Paneli
             if (_seciliHedef == SeciliHedef.ref1 && _ref1Hazir) ...[
               const SizedBox(height: 8),
               Card(
@@ -1262,7 +1299,6 @@ class _KameraOlcumSayfasiState extends State<KameraOlcumSayfasi> {
                 ),
               ),
             ],
-            // Ref-2 İnce Ayar Paneli
             if (_seciliHedef == SeciliHedef.ref2 && _ref2Hazir) ...[
               const SizedBox(height: 8),
               Card(
@@ -1325,7 +1361,6 @@ class _KameraOlcumSayfasiState extends State<KameraOlcumSayfasi> {
                 ),
               ),
             ],
-            // Seçili Tomruk İnce Ayar Paneli
             if (seciliTomruk != null) ...[
               const SizedBox(height: 8),
               Card(
@@ -1443,10 +1478,9 @@ class _KameraOlcumSayfasiState extends State<KameraOlcumSayfasi> {
                 padding: EdgeInsets.all(20),
                 child: Text(
                   'Başlamak için "Kamera ile Çek" veya "Galeriden Seç" butonuna basın.\n\n'
-                  '1) Ref-1 modunda çapını bildiğiniz tomruğun 2 karşı kenarına dokunun (kırmızı çember).\n'
-                  '2) (Opsiyonel) Uzak/diğer uçta Ref-2 işaretleyerek perspektif sapmasını düzeltin.\n'
-                  '3) (Opsiyonel) Alan modunda 2 köşeye dokunup istifi çerçeveleyin.\n'
-                  '4) "Say" butonuna basın.',
+                  '1) Ref-1 modunda çapını bildiğiniz tomruğun 2 karşı kenarına dokunun.\n'
+                  '2) (Opsiyonel) Uzak uçta Ref-2 işaretleyin ve Alan çerçevesi çizin.\n'
+                  '3) "Say" butonuna basın.',
                   textAlign: TextAlign.center,
                 ),
               ),
@@ -1569,7 +1603,6 @@ class _OlcumOverlayPainter extends CustomPainter {
 
   @override
   void paint(Canvas canvas, Size size) {
-    // İstif Çerçevesi (ROI - Mavi)
     if (roiNorm != null) {
       final rect = Rect.fromLTRB(
         roiNorm!.left * size.width,
@@ -1592,11 +1625,9 @@ class _OlcumOverlayPainter extends CustomPainter {
       );
     }
 
-    // Ref-1 (Kırmızı) ve Ref-2 (Turuncu)
     _cizReferans(canvas, size, ref1P1, ref1Center, ref1CapNorm, ref1CapCm, Colors.redAccent, 'R1', ref1Secili);
     _cizReferans(canvas, size, ref2P1, ref2Center, ref2CapNorm, ref2CapCm, Colors.orange, 'R2', ref2Secili);
 
-    // Tespit edilen tomruklar
     for (int i = 0; i < tomruklar.length; i++) {
       final t = tomruklar[i];
       final isSelected = i == seciliIdx;
