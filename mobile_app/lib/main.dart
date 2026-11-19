@@ -195,15 +195,13 @@ class _AdayDaire {
 
 class YoloTfliteServisi {
   Interpreter? _interpreter;
-  String debugBilgi = '';
   bool get aktif => _interpreter != null;
 
   Future<bool> yukle() async {
     try {
       _interpreter = await Interpreter.fromAsset('assets/models/tomruk_model.tflite');
       return true;
-    } catch (e) {
-      debugBilgi = 'Yukleme hatasi: $e';
+    } catch (_) {
       _interpreter = null;
       return false;
     }
@@ -214,137 +212,72 @@ class YoloTfliteServisi {
     _interpreter = null;
   }
 
-  List<_AdayDaire> _tekKareTespit(img.Image kare, {double confEsik = 0.15}) {
+  List<_AdayDaire> _tekKareTespit(img.Image kare, {double confEsik = 0.25}) {
     if (_interpreter == null) return [];
-    try {
-      final inTensor = _interpreter!.getInputTensor(0);
-      final outTensor = _interpreter!.getOutputTensor(0);
-      final inputShape = inTensor.shape;
-      final outShape = outTensor.shape;
+    final inputShape = _interpreter!.getInputTensor(0).shape;
+    final int inH = inputShape.length >= 3 ? inputShape[1] : 640;
+    final int inW = inputShape.length >= 3 ? inputShape[2] : 640;
 
-      final bool isNchw = inputShape.length == 4 && inputShape[1] == 3;
-      final int inH = isNchw ? inputShape[2] : (inputShape.length >= 3 ? inputShape[1] : 640);
-      final int inW = isNchw ? inputShape[3] : (inputShape.length >= 3 ? inputShape[2] : 640);
-
-      final img.Image resized = img.copyResize(kare, width: inW, height: inH);
-
-      final Object input;
-      if (isNchw) {
-        final rPlane = List.generate(inH, (_) => List<double>.filled(inW, 0.0));
-        final gPlane = List.generate(inH, (_) => List<double>.filled(inW, 0.0));
-        final bPlane = List.generate(inH, (_) => List<double>.filled(inW, 0.0));
-        for (int y = 0; y < inH; y++) {
-          for (int x = 0; x < inW; x++) {
+    final img.Image resized = img.copyResize(kare, width: inW, height: inH);
+    final input = List.generate(
+      1,
+      (_) => List.generate(
+        inH,
+        (y) => List.generate(
+          inW,
+          (x) {
             final p = resized.getPixel(x, y);
-            rPlane[y][x] = p.r / 255.0;
-            gPlane[y][x] = p.g / 255.0;
-            bPlane[y][x] = p.b / 255.0;
-          }
-        }
-        input = [
-          [rPlane, gPlane, bPlane]
-        ];
-      } else {
-        input = List.generate(
-          1,
-          (_) => List.generate(
-            inH,
-            (y) => List.generate(
-              inW,
-              (x) {
-                final p = resized.getPixel(x, y);
-                return [p.r / 255.0, p.g / 255.0, p.b / 255.0];
-              },
-            ),
-          ),
-        );
+            return [p.r / 255.0, p.g / 255.0, p.b / 255.0];
+          },
+        ),
+      ),
+    );
+
+    final outShape = _interpreter!.getOutputTensor(0).shape;
+    final int dim1 = outShape[1];
+    final int dim2 = outShape[2];
+    final output = List.generate(
+      1,
+      (_) => List.generate(dim1, (_) => List<double>.filled(dim2, 0.0)),
+    );
+
+    _interpreter!.run(input, output);
+
+    final List<_AdayDaire> adaylar = [];
+    final bool kanalOnce = dim1 < dim2;
+    final int kutuSayisi = kanalOnce ? dim2 : dim1;
+    final int ozellikSayisi = kanalOnce ? dim1 : dim2;
+
+    for (int i = 0; i < kutuSayisi; i++) {
+      double maxConf = 0.0;
+      for (int c = 4; c < ozellikSayisi; c++) {
+        final double val = kanalOnce ? output[0][c][i] : output[0][i][c];
+        if (val > maxConf) maxConf = val;
+      }
+      if (maxConf < confEsik) continue;
+
+      double cx = kanalOnce ? output[0][0][i] : output[0][i][0];
+      double cy = kanalOnce ? output[0][1][i] : output[0][i][1];
+      double bw = kanalOnce ? output[0][2][i] : output[0][i][2];
+      double bh = kanalOnce ? output[0][3][i] : output[0][i][3];
+
+      if (cx > 2.0 || cy > 2.0 || bw > 2.0) {
+        cx /= inW;
+        cy /= inH;
+        bw /= inW;
+        bh /= inH;
       }
 
-      final int dim1 = outShape[1];
-      final int dim2 = outShape[2];
-      final output = List.generate(
-        1,
-        (_) => List.generate(dim1, (_) => List<double>.filled(dim2, 0.0)),
-      );
-
-      _interpreter!.run(input, output);
-
-      final List<_AdayDaire> adaylar = [];
-      double enYuksekSkor = 0.0;
-
-      // Yeni end-to-end / NMS'li çıktı formatı: [1, 300, 6] -> [x1, y1, x2, y2, conf, cls]
-      if (dim2 == 6 && dim1 > 6) {
-        for (int i = 0; i < dim1; i++) {
-          final double conf = output[0][i][4];
-          if (conf > enYuksekSkor) enYuksekSkor = conf;
-          if (conf < confEsik) continue;
-
-          double x1 = output[0][i][0];
-          double y1 = output[0][i][1];
-          double x2 = output[0][i][2];
-          double y2 = output[0][i][3];
-          if (x2 > 2.0 || y2 > 2.0) {
-            x1 /= inW;
-            x2 /= inW;
-            y1 /= inH;
-            y2 /= inH;
-          }
-          final double cx = (x1 + x2) / 2.0;
-          final double cy = (y1 + y2) / 2.0;
-          final double rNorm = ((x2 - x1).abs() + (y2 - y1).abs()) / 4.0;
-          if (rNorm > 0.005 && rNorm < 0.35) {
-            adaylar.add(_AdayDaire(cx.clamp(0.0, 1.0).toDouble(), cy.clamp(0.0, 1.0).toDouble(), rNorm, conf));
-          }
-        }
-      } else {
-        // Klasik YOLOv8 çıktısı: [1, 5, 8400] veya [1, 8400, 5]
-        final bool kanalOnce = dim1 < dim2;
-        final int kutuSayisi = kanalOnce ? dim2 : dim1;
-        final int ozellikSayisi = kanalOnce ? dim1 : dim2;
-
-        for (int i = 0; i < kutuSayisi; i++) {
-          double maxConf = 0.0;
-          for (int c = 4; c < ozellikSayisi; c++) {
-            final double val = kanalOnce ? output[0][c][i] : output[0][i][c];
-            if (val > maxConf) maxConf = val;
-          }
-          if (maxConf > enYuksekSkor) enYuksekSkor = maxConf;
-          if (maxConf < confEsik) continue;
-
-          double cx = kanalOnce ? output[0][0][i] : output[0][i][0];
-          double cy = kanalOnce ? output[0][1][i] : output[0][i][1];
-          double bw = kanalOnce ? output[0][2][i] : output[0][i][2];
-          double bh = kanalOnce ? output[0][3][i] : output[0][i][3];
-
-          if (cx > 2.0 || cy > 2.0 || bw > 2.0) {
-            cx /= inW;
-            cy /= inH;
-            bw /= inW;
-            bh /= inH;
-          }
-
-          final double rNorm = (bw + bh) / 4.0;
-          if (rNorm > 0.005 && rNorm < 0.35) {
-            adaylar.add(_AdayDaire(
-              cx.clamp(0.0, 1.0).toDouble(),
-              cy.clamp(0.0, 1.0).toDouble(),
-              rNorm,
-              maxConf,
-            ));
-          }
-        }
+      final double rNorm = (bw + bh) / 4.0;
+      if (rNorm > 0.005 && rNorm < 0.35) {
+        adaylar.add(_AdayDaire(cx.clamp(0.0, 1.0).toDouble(), cy.clamp(0.0, 1.0).toDouble(), rNorm, maxConf));
       }
-
-      debugBilgi = 'in:$inputShape out:$outShape max:${enYuksekSkor.toStringAsFixed(2)}';
-      return adaylar;
-    } catch (e) {
-      debugBilgi = 'HATA: $e';
-      return [];
     }
+    return adaylar;
   }
 
   /// Uzun istifler için %20 örtüşmeli otomatik yatay dilimleme + tam kare birleştirme
-  List<_AdayDaire> dilimliTespitEt(img.Image orijinal, {double confEsik = 0.15}) {
+  List<_AdayDaire> dilimliTespitEt(img.Image orijinal, {double confEsik = 0.25}) {
     final List<_AdayDaire> tumu = [];
     tumu.addAll(_tekKareTespit(orijinal, confEsik: confEsik));
 
@@ -371,12 +304,7 @@ class YoloTfliteServisi {
           final gx = (startX + a.x * dilimW) / orijinal.width;
           final gy = a.y;
           final gr = (a.r * dilimW) / orijinal.width;
-          tumu.add(_AdayDaire(
-            gx.clamp(0.0, 1.0).toDouble(),
-            gy.clamp(0.0, 1.0).toDouble(),
-            gr,
-            a.skor,
-          ));
+          tumu.add(_AdayDaire(gx.clamp(0.0, 1.0).toDouble(), gy.clamp(0.0, 1.0).toDouble(), gr, a.skor));
         }
       }
     }
@@ -1088,7 +1016,7 @@ class _KameraOlcumSayfasiState extends State<KameraOlcumSayfasi> {
       if (orijinal == null) return;
 
       List<_AdayDaire> hamAdaylar = _yolo.aktif
-          ? _yolo.dilimliTespitEt(orijinal, confEsik: 0.15)
+          ? _yolo.dilimliTespitEt(orijinal, confEsik: 0.25)
           : _yedekMotorDilimliTespit(orijinal);
 
       if (_roiNorm != null) {
@@ -1139,14 +1067,10 @@ class _KameraOlcumSayfasiState extends State<KameraOlcumSayfasi> {
 
       if (mounted) {
         final motor = _yolo.aktif ? 'YOLO-TFLite' : 'Dilimlemeli Yedek';
-        final ek = bulunanlar.isEmpty && _yolo.debugBilgi.isNotEmpty
-            ? ' | ${_yolo.debugBilgi}'
-            : '';
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
-            duration: const Duration(seconds: 8),
             content: Text(
-              '[$motor] ${bulunanlar.length} tomruk bulundu.$ek',
+              '[$motor] ${bulunanlar.length} tomruk bulundu. Şimdi 1–5 tomruğa dokunup referans çapını (cm) girin.',
             ),
           ),
         );
