@@ -19,6 +19,11 @@ jobs:
       - name: Depoyu Klonla (Checkout)
         uses: actions/checkout@v4
 
+      - name: Python Kurulumu (İkon Dönüştürme İçin)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
       - name: Java (JDK 17) Kurulumu
         uses: actions/setup-java@v4
         with:
@@ -39,7 +44,48 @@ jobs:
           cd mobile_app
           flutter pub add image_picker image crypto shared_preferences
 
-      - name: Uygulama Kodunu Yaz (Lisanslama + Kabuksuz Ölçüm Motoru)
+      - name: Uygulama Simgesini (Android Launcher Icon) Ayarla
+        run: |
+          pip install pillow
+          python - << 'PYEOF'
+          import os
+          from PIL import Image
+
+          candidates = [
+              "app_icon.png", "app_icon.jpg", "app_icon.jpeg",
+              "157433.jpg", "157433.png",
+              "assets/app_icon.png", "assets/app_icon.jpg",
+              "mobile_app/assets/app_icon.png", "mobile_app/assets/app_icon.jpg"
+          ]
+          src = next((p for p in candidates if os.path.exists(p)), None)
+
+          if not src:
+              print("Uyarı: İkon görseli bulunamadı (app_icon.jpg veya 157433.jpg yükleyin). Varsayılan simge korunuyor.")
+          else:
+              print(f"Uygulama simgesi hazırlanıyor: {src}")
+              im = Image.open(src).convert("RGBA")
+              # Kare kırpma / ortalama (beyaz arka planlı)
+              side = max(im.size)
+              square = Image.new("RGBA", (side, side), (255, 255, 255, 255))
+              square.paste(im, ((side - im.width) // 2, (side - im.height) // 2), im)
+
+              sizes = {
+                  "mipmap-mdpi": 48,
+                  "mipmap-hdpi": 72,
+                  "mipmap-xhdpi": 96,
+                  "mipmap-xxhdpi": 144,
+                  "mipmap-xxxhdpi": 192,
+              }
+              res_dir = "mobile_app/android/app/src/main/res"
+              for folder, px in sizes.items():
+                  out_dir = os.path.join(res_dir, folder)
+                  os.makedirs(out_dir, exist_ok=True)
+                  resized = square.resize((px, px), Image.Resampling.LANCZOS)
+                  resized.save(os.path.join(out_dir, "ic_launcher.png"), format="PNG")
+              print("Tüm Android mipmap uygulama simgeleri başarıyla güncellendi.")
+          PYEOF
+
+      - name: Uygulama Kodunu Yaz (Yönetici Erişimi + Kabuksuz Ölçüm Motoru)
         run: |
           cat << 'EOF' > mobile_app/lib/main.dart
           import 'dart:convert';
@@ -125,6 +171,104 @@ jobs:
                 return true;
               }
               return false;
+            }
+
+            /// Hem lisans ekranından hem ana ekrandan erişilebilen ortak Yönetici Lisans Paneli
+            static void yoneticiPaneliGoster(BuildContext context, {String varsayilanTalep = ''}) {
+              final sifreCtrl = TextEditingController();
+              final talepCtrl = TextEditingController(text: varsayilanTalep);
+              String? uretilenAnahtar;
+              bool yetkili = false;
+              String? sifreHata;
+
+              showDialog(
+                context: context,
+                builder: (ctx) {
+                  return StatefulBuilder(
+                    builder: (ctx, setModalState) {
+                      return AlertDialog(
+                        title: const Text('Yönetici Lisans Paneli'),
+                        content: Column(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            if (!yetkili) ...[
+                              TextField(
+                                controller: sifreCtrl,
+                                obscureText: true,
+                                decoration: InputDecoration(
+                                  labelText: 'Yönetici Şifresi',
+                                  errorText: sifreHata,
+                                  border: const OutlineInputBorder(),
+                                ),
+                              ),
+                            ] else ...[
+                              TextField(
+                                controller: talepCtrl,
+                                textCapitalization: TextCapitalization.characters,
+                                decoration: const InputDecoration(
+                                  labelText: 'Kullanıcı Talep Kodu (TALEP-XXXX)',
+                                  border: OutlineInputBorder(),
+                                ),
+                              ),
+                              const SizedBox(height: 12),
+                              FilledButton(
+                                onPressed: () {
+                                  if (talepCtrl.text.trim().isEmpty) return;
+                                  setModalState(() {
+                                    uretilenAnahtar = lisansAnahtariUret(talepCtrl.text);
+                                  });
+                                },
+                                child: const Text('Lisans Anahtarı Üret'),
+                              ),
+                              if (uretilenAnahtar != null) ...[
+                                const SizedBox(height: 12),
+                                SelectableText(
+                                  uretilenAnahtar!,
+                                  style: const TextStyle(
+                                    fontSize: 18,
+                                    fontWeight: FontWeight.bold,
+                                    color: Colors.green,
+                                  ),
+                                ),
+                                TextButton.icon(
+                                  icon: const Icon(Icons.copy),
+                                  label: const Text('Kopyala'),
+                                  onPressed: () {
+                                    Clipboard.setData(ClipboardData(text: uretilenAnahtar!));
+                                    ScaffoldMessenger.of(context).showSnackBar(
+                                      const SnackBar(content: Text('Lisans anahtarı kopyalandı.')),
+                                    );
+                                  },
+                                ),
+                              ],
+                            ],
+                          ],
+                        ),
+                        actions: [
+                          TextButton(
+                            onPressed: () => Navigator.of(ctx).pop(),
+                            child: const Text('Kapat'),
+                          ),
+                          if (!yetkili)
+                            FilledButton(
+                              onPressed: () {
+                                if (yoneticiSifresiDogrula(sifreCtrl.text)) {
+                                  setModalState(() {
+                                    yetkili = true;
+                                    sifreHata = null;
+                                  });
+                                } else {
+                                  setModalState(() => sifreHata = 'Hatalı yönetici şifresi');
+                                }
+                              },
+                              child: const Text('Giriş'),
+                            ),
+                        ],
+                      );
+                    },
+                  );
+                },
+              );
             }
           }
 
@@ -224,7 +368,7 @@ jobs:
           }
 
           // ====================================================================
-          // 3. ÇEVRİMDIŞI LİSANS VE GİZLİ YÖNETİCİ PANELİ
+          // 3. ÇEVRİMDIŞI LİSANS EKRANI
           // ====================================================================
           class LisansEkrani extends StatefulWidget {
             const LisansEkrani({super.key});
@@ -267,101 +411,6 @@ jobs:
               }
             }
 
-            void _yoneticiPaneliAc() {
-              final sifreCtrl = TextEditingController();
-              final talepCtrl = TextEditingController(text: _talepKodu);
-              String? uretilenAnahtar;
-              bool yetkili = false;
-              String? sifreHata;
-
-              showDialog(
-                context: context,
-                builder: (ctx) {
-                  return StatefulBuilder(
-                    builder: (ctx, setModalState) {
-                      return AlertDialog(
-                        title: const Text('Yönetici Lisans Paneli'),
-                        content: Column(
-                          mainAxisSize: MainAxisSize.min,
-                          children: [
-                            if (!yetkili) ...[
-                              TextField(
-                                controller: sifreCtrl,
-                                obscureText: true,
-                                decoration: InputDecoration(
-                                  labelText: 'Yönetici Şifresi',
-                                  errorText: sifreHata,
-                                  border: const OutlineInputBorder(),
-                                ),
-                              ),
-                            ] else ...[
-                              TextField(
-                                controller: talepCtrl,
-                                decoration: const InputDecoration(
-                                  labelText: 'Kullanıcı Talep Kodu (TALEP-XXXX)',
-                                  border: OutlineInputBorder(),
-                                ),
-                              ),
-                              const SizedBox(height: 12),
-                              FilledButton(
-                                onPressed: () {
-                                  setModalState(() {
-                                    uretilenAnahtar = LisansServisi.lisansAnahtariUret(talepCtrl.text);
-                                  });
-                                },
-                                child: const Text('Lisans Anahtarı Üret'),
-                              ),
-                              if (uretilenAnahtar != null) ...[
-                                const SizedBox(height: 12),
-                                SelectableText(
-                                  uretilenAnahtar!,
-                                  style: const TextStyle(
-                                    fontSize: 18,
-                                    fontWeight: FontWeight.bold,
-                                    color: Colors.green,
-                                  ),
-                                ),
-                                TextButton.icon(
-                                  icon: const Icon(Icons.copy),
-                                  label: const Text('Kopyala'),
-                                  onPressed: () {
-                                    Clipboard.setData(ClipboardData(text: uretilenAnahtar!));
-                                    ScaffoldMessenger.of(context).showSnackBar(
-                                      const SnackBar(content: Text('Lisans anahtarı kopyalandı.')),
-                                    );
-                                  },
-                                ),
-                              ],
-                            ],
-                          ],
-                        ),
-                        actions: [
-                          TextButton(
-                            onPressed: () => Navigator.of(ctx).pop(),
-                            child: const Text('Kapat'),
-                          ),
-                          if (!yetkili)
-                            FilledButton(
-                              onPressed: () {
-                                if (LisansServisi.yoneticiSifresiDogrula(sifreCtrl.text)) {
-                                  setModalState(() {
-                                    yetkili = true;
-                                    sifreHata = null;
-                                  });
-                                } else {
-                                  setModalState(() => sifreHata = 'Hatalı yönetici şifresi');
-                                }
-                              },
-                              child: const Text('Giriş'),
-                            ),
-                        ],
-                      );
-                    },
-                  );
-                },
-              );
-            }
-
             @override
             Widget build(BuildContext context) {
               return Scaffold(
@@ -372,7 +421,10 @@ jobs:
                     IconButton(
                       tooltip: 'Yönetici Paneli',
                       icon: const Icon(Icons.admin_panel_settings),
-                      onPressed: _yoneticiPaneliAc,
+                      onPressed: () => LisansServisi.yoneticiPaneliGoster(
+                        context,
+                        varsayilanTalep: _talepKodu,
+                      ),
                     ),
                   ],
                 ),
@@ -985,7 +1037,6 @@ jobs:
               }
             }
 
-            /// Kabuksuz net hacim: Ondalık çaplar tam sayıya AŞAĞI yuvarlanarak (floor) hesaplanır
             double _netHacimHesapla(double capCm) {
               final int tamCapCm = capCm.floor();
               final rMetre = (tamCapCm / 100.0) / 2.0;
@@ -1033,7 +1084,10 @@ jobs:
 
               return Scaffold(
                 appBar: AppBar(
-                  title: const Text('TomrukOlcumAI'),
+                  title: GestureDetector(
+                    onLongPress: () => LisansServisi.yoneticiPaneliGoster(context),
+                    child: const Text('TomrukOlcumAI'),
+                  ),
                   backgroundColor: Theme.of(context).colorScheme.primaryContainer,
                   actions: [
                     if (_seciliFoto != null)
@@ -1435,12 +1489,12 @@ jobs:
           }
           EOF
 
-      - name: Güncel Kodu Depoya Kaydet
+      - name: Güncel Kodu ve Simgeleri Depoya Kaydet
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add mobile_app
-          git diff --staged --quiet || git commit -m "feat: Emval Boyu serbest klavye girisi eklendi"
+          git diff --staged --quiet || git commit -m "feat: ana ekrandan yonetici paneli erisimi ve uygulama simgesi eklendi"
           git push
 
       - name: R8/ProGuard Aktifle, Test Et ve APK Üret
