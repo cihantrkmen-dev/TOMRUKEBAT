@@ -1863,13 +1863,14 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add mobile_app
-          git diff --staged --quiet || git commit -m "fix: double tip donusumu duzeltildi"
+          git diff --staged --quiet || git commit -m "fix: kotlin jvm target validation hatasi giderildi"
           git push
 
       - name: R8/ProGuard Aktifle, Test Et ve APK Üret
         working-directory: mobile_app
         run: |
           mkdir -p android/app
+          grep -q "kotlin.jvm.target.validation.mode" android/gradle.properties 2>/dev/null || echo "kotlin.jvm.target.validation.mode=IGNORE" >> android/gradle.properties
           grep -q "org.tensorflow.lite" android/app/proguard-rules.pro 2>/dev/null || printf '\n-keep class org.tensorflow.lite.** { *; }\n-dontwarn org.tensorflow.lite.**\n' >> android/app/proguard-rules.pro
 
           if [ -f android/build.gradle.kts ]; then
