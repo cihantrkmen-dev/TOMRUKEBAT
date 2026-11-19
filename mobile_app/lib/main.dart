@@ -7,6 +7,9 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:image/image.dart' as img;
 import 'package:image_picker/image_picker.dart';
+import 'package:pdf/pdf.dart';
+import 'package:pdf/widgets.dart' as pw;
+import 'package:printing/printing.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:tflite_flutter/tflite_flutter.dart';
 
@@ -180,12 +183,12 @@ class LisansServisi {
 }
 
 // ====================================================================
-// 2. ÇEVRİMDIŞI YOLO-TFLITE YAPAY ZEKA SERVİSİ
+// 2. ÇEVRİMDIŞI YOLO-TFLITE + OTOMATİK DİLİMLEME (TILING / SAHI)
 // ====================================================================
 class _AdayDaire {
-  final double x; // 0..1 normalize
-  final double y; // 0..1 normalize
-  double r;       // genişlik normalize yarıçap
+  final double x; // 0..1 global genişlik
+  final double y; // 0..1 global yükseklik
+  double r;       // global genişliğe göre yarıçap
   final double skor;
   _AdayDaire(this.x, this.y, this.r, this.skor);
 }
@@ -209,14 +212,13 @@ class YoloTfliteServisi {
     _interpreter = null;
   }
 
-  /// Standart Ultralytics YOLOv8 TFLite (640x640 float32) çıkarımı
-  List<_AdayDaire> tespitEt(img.Image orijinal, {double confEsik = 0.25}) {
+  List<_AdayDaire> _tekKareTespit(img.Image kare, {double confEsik = 0.25}) {
     if (_interpreter == null) return [];
-    final inputShape = _interpreter!.getInputTensor(0).shape; // [1, H, W, 3]
+    final inputShape = _interpreter!.getInputTensor(0).shape;
     final int inH = inputShape.length >= 3 ? inputShape[1] : 640;
     final int inW = inputShape.length >= 3 ? inputShape[2] : 640;
 
-    final img.Image resized = img.copyResize(orijinal, width: inW, height: inH);
+    final img.Image resized = img.copyResize(kare, width: inW, height: inH);
     final input = List.generate(
       1,
       (_) => List.generate(
@@ -232,7 +234,6 @@ class YoloTfliteServisi {
     );
 
     final outShape = _interpreter!.getOutputTensor(0).shape;
-    // Genellikle [1, 4+nc, 8400] veya [1, 8400, 4+nc]
     final int dim1 = outShape[1];
     final int dim2 = outShape[2];
     final output = List.generate(
@@ -243,7 +244,7 @@ class YoloTfliteServisi {
     _interpreter!.run(input, output);
 
     final List<_AdayDaire> adaylar = [];
-    final bool kanalOnce = dim1 < dim2; // [1, 5, 8400]
+    final bool kanalOnce = dim1 < dim2;
     final int kutuSayisi = kanalOnce ? dim2 : dim1;
     final int ozellikSayisi = kanalOnce ? dim1 : dim2;
 
@@ -260,7 +261,6 @@ class YoloTfliteServisi {
       double bw = kanalOnce ? output[0][2][i] : output[0][i][2];
       double bh = kanalOnce ? output[0][3][i] : output[0][i][3];
 
-      // Piksel koordinatındaysa normalize et
       if (cx > 2.0 || cy > 2.0 || bw > 2.0) {
         cx /= inW;
         cy /= inH;
@@ -274,6 +274,210 @@ class YoloTfliteServisi {
       }
     }
     return adaylar;
+  }
+
+  /// Uzun istifler için %20 örtüşmeli otomatik yatay dilimleme + tam kare birleştirme
+  List<_AdayDaire> dilimliTespitEt(img.Image orijinal, {double confEsik = 0.25}) {
+    final List<_AdayDaire> tumu = [];
+    // 1) Tam kare taraması (büyük tomrukları yakalar)
+    tumu.addAll(_tekKareTespit(orijinal, confEsik: confEsik));
+
+    // 2) Geniş/yüksek çözünürlüklü karelerde %20 örtüşmeli 2 veya 3 dilim
+    if (orijinal.width >= 900) {
+      final int dilimSayisi = (orijinal.width / max(1, orijinal.height)) > 1.45 ? 3 : 2;
+      final double ortusme = 0.20;
+      final double dilimGenislikOran = 1.0 / (dilimSayisi - (dilimSayisi - 1) * ortusme);
+      final int dilimW = (orijinal.width * dilimGenislikOran).round().clamp(1, orijinal.width);
+      final int adimX = dilimSayisi > 1
+          ? ((orijinal.width - dilimW) / (dilimSayisi - 1)).round()
+          : 0;
+
+      for (int d = 0; d < dilimSayisi; d++) {
+        final int startX = (d * adimX).clamp(0, max(0, orijinal.width - dilimW));
+        final img.Image parca = img.copyCrop(
+          orijinal,
+          x: startX,
+          y: 0,
+          width: dilimW,
+          height: orijinal.height,
+        );
+        final parcaAdaylar = _tekKareTespit(parca, confEsik: confEsik);
+        for (final a in parcaAdaylar) {
+          final gx = (startX + a.x * dilimW) / orijinal.width;
+          final gy = a.y;
+          final gr = (a.r * dilimW) / orijinal.width;
+          tumu.add(_AdayDaire(gx.clamp(0.0, 1.0), gy.clamp(0.0, 1.0), gr, a.skor));
+        }
+      }
+    }
+    return tumu;
+  }
+}
+
+// ====================================================================
+// 3. ÇEVRİMDIŞI PDF ÇAP-ADET DÖKÜM SERVİSİ
+// ====================================================================
+class PdfRaporServisi {
+  static Future<void> raporOlusturVePaylas({
+    required List<int> tamCaplarCm,
+    required double emvalBoyuM,
+    required int parcaSayisi,
+  }) async {
+    pw.Font? regularFont;
+    pw.Font? boldFont;
+    try {
+      final regData = await rootBundle.load('assets/fonts/DejaVuSans.ttf');
+      regularFont = pw.Font.ttf(regData);
+      final boldData = await rootBundle.load('assets/fonts/DejaVuSans-Bold.ttf');
+      boldFont = pw.Font.ttf(boldData);
+    } catch (_) {
+      regularFont = pw.Font.helvetica();
+      boldFont = pw.Font.helveticaBold();
+    }
+
+    // Çaplara göre grupla ve küçükten büyüğe sırala
+    final Map<int, int> capAdetMap = {};
+    for (final c in tamCaplarCm) {
+      capAdetMap[c] = (capAdetMap[c] ?? 0) + 1;
+    }
+    final sortedCaplar = capAdetMap.keys.toList()..sort();
+
+    double tekilHacim(int capCm) {
+      final r = (capCm / 100.0) / 2.0;
+      return pi * r * r * emvalBoyuM;
+    }
+
+    int toplamAdet = 0;
+    double toplamHacim = 0.0;
+    int inceAdet = 0, ortaAdet = 0, kalinAdet = 0;
+    double inceHacim = 0, ortaHacim = 0, kalinHacim = 0;
+
+    final List<List<String>> tabloSatirlari = [];
+    for (final cap in sortedCaplar) {
+      final adet = capAdetMap[cap]!;
+      final tekil = tekilHacim(cap);
+      final satirToplam = tekil * adet;
+      toplamAdet += adet;
+      toplamHacim += satirToplam;
+
+      if (cap < 20) {
+        inceAdet += adet;
+        inceHacim += satirToplam;
+      } else if (cap < 30) {
+        ortaAdet += adet;
+        ortaHacim += satirToplam;
+      } else {
+        kalinAdet += adet;
+        kalinHacim += satirToplam;
+      }
+
+      tabloSatirlari.add([
+        '$cap cm',
+        '$adet',
+        tekil.toStringAsFixed(4),
+        satirToplam.toStringAsFixed(3),
+      ]);
+    }
+
+    final now = DateTime.now();
+    final tarihStr =
+        '${now.day.toString().padLeft(2, '0')}.${now.month.toString().padLeft(2, '0')}.${now.year} '
+        '${now.hour.toString().padLeft(2, '0')}:${now.minute.toString().padLeft(2, '0')}';
+
+    final doc = pw.Document(
+      theme: pw.ThemeData.withFont(base: regularFont, bold: boldFont),
+    );
+
+    doc.addPage(
+      pw.MultiPage(
+        pageFormat: PdfPageFormat.a4,
+        margin: const pw.EdgeInsets.all(28),
+        build: (context) => [
+          pw.Header(
+            level: 0,
+            child: pw.Row(
+              mainAxisAlignment: pw.MainAxisAlignment.spaceBetween,
+              children: [
+                pw.Column(
+                  crossAxisAlignment: pw.CrossAxisAlignment.start,
+                  children: [
+                    pw.Text(
+                      'TomrukOlcumAI - Emval Çap ve Hacim Dökümü',
+                      style: pw.TextStyle(fontSize: 16, fontWeight: pw.FontWeight.bold),
+                    ),
+                    pw.Text(
+                      'Geliştirici: CİHAN TÜRKMEN | Denizli Orman Bölge Müdürlüğü',
+                      style: const pw.TextStyle(fontSize: 9, color: PdfColors.grey700),
+                    ),
+                  ],
+                ),
+                pw.Text(tarihStr, style: const pw.TextStyle(fontSize: 10)),
+              ],
+            ),
+          ),
+          pw.SizedBox(height: 8),
+          pw.Container(
+            padding: const pw.EdgeInsets.all(10),
+            decoration: pw.BoxDecoration(
+              color: PdfColors.grey100,
+              border: pw.Border.all(color: PdfColors.grey400),
+              borderRadius: const pw.BorderRadius.all(pw.Radius.circular(4)),
+            ),
+            child: pw.Row(
+              mainAxisAlignment: pw.MainAxisAlignment.spaceBetween,
+              children: [
+                pw.Text('Emval Boyu: ${emvalBoyuM.toStringAsFixed(2)} m (Kabuksuz)'),
+                pw.Text('Ölçülen Kare/Parça: $parcaSayisi'),
+                pw.Text(
+                  'Toplam: $toplamAdet Adet | ${toplamHacim.toStringAsFixed(3)} m³',
+                  style: pw.TextStyle(fontWeight: pw.FontWeight.bold),
+                ),
+              ],
+            ),
+          ),
+          pw.SizedBox(height: 14),
+          pw.TableHelper.fromTextArray(
+            headers: const ['Çap (cm)', 'Adet', 'Tekil Hacim (m³)', 'Toplam Hacim (m³)'],
+            data: [
+              ...tabloSatirlari,
+              ['GENEL TOPLAM', '$toplamAdet', '-', toplamHacim.toStringAsFixed(3)],
+            ],
+            headerStyle: pw.TextStyle(fontWeight: pw.FontWeight.bold, color: PdfColors.white),
+            headerDecoration: const pw.BoxDecoration(color: PdfColor.fromInt(0xFF2E5A27)),
+            cellAlignment: pw.Alignment.center,
+            cellPadding: const pw.EdgeInsets.symmetric(vertical: 5, horizontal: 8),
+          ),
+          pw.SizedBox(height: 16),
+          pw.Text(
+            'Çap Sınıfı Dağılımı',
+            style: pw.TextStyle(fontSize: 12, fontWeight: pw.FontWeight.bold),
+          ),
+          pw.SizedBox(height: 6),
+          pw.TableHelper.fromTextArray(
+            headers: const ['Sınıf', 'Adet', 'Toplam Hacim (m³)'],
+            data: [
+              ['İnce (< 20 cm)', '$inceAdet', inceHacim.toStringAsFixed(3)],
+              ['Orta (20 - 29 cm)', '$ortaAdet', ortaHacim.toStringAsFixed(3)],
+              ['Kalın (30+ cm)', '$kalinAdet', kalinHacim.toStringAsFixed(3)],
+            ],
+            headerStyle: pw.TextStyle(fontWeight: pw.FontWeight.bold),
+            headerDecoration: const pw.BoxDecoration(color: PdfColors.grey200),
+            cellAlignment: pw.Alignment.center,
+          ),
+          pw.SizedBox(height: 12),
+          pw.Text(
+            'Not: Tüm ondalık çaplar standart gereği tam sayıya aşağı yuvarlanarak (floor) kabuksuz silindirik net hacim hesaplanmıştır.',
+            style: const pw.TextStyle(fontSize: 8, color: PdfColors.grey600),
+          ),
+        ],
+      ),
+    );
+
+    final bytes = await doc.save();
+    await Printing.sharePdf(
+      bytes: bytes,
+      filename: 'TomrukOlcumAI_Dokum_${now.year}${now.month}${now.day}_${now.hour}${now.minute}.pdf',
+    );
   }
 }
 
@@ -295,7 +499,7 @@ class TomrukOlcumApp extends StatelessWidget {
 }
 
 // ====================================================================
-// 3. AÇILIŞ EKRANI (SPLASH SCREEN)
+// 4. AÇILIŞ EKRANI (SPLASH SCREEN)
 // ====================================================================
 class AcilisEkrani extends StatefulWidget {
   const AcilisEkrani({super.key});
@@ -347,20 +551,13 @@ class _AcilisEkraniState extends State<AcilisEkrani> {
               const Text(
                 'Geliştirici CİHAN TÜRKMEN',
                 textAlign: TextAlign.center,
-                style: TextStyle(
-                  color: Colors.white,
-                  fontSize: 16,
-                  fontWeight: FontWeight.w600,
-                ),
+                style: TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.w600),
               ),
               const SizedBox(height: 4),
               const Text(
                 'Denizli Orman Bölge Müdürlüğü',
                 textAlign: TextAlign.center,
-                style: TextStyle(
-                  color: Colors.white70,
-                  fontSize: 14,
-                ),
+                style: TextStyle(color: Colors.white70, fontSize: 14),
               ),
               const SizedBox(height: 32),
               const CircularProgressIndicator(color: Colors.lightGreenAccent),
@@ -373,7 +570,7 @@ class _AcilisEkraniState extends State<AcilisEkrani> {
 }
 
 // ====================================================================
-// 4. ÇEVRİMDIŞI LİSANS EKRANI
+// 5. ÇEVRİMDIŞI LİSANS EKRANI
 // ====================================================================
 class LisansEkrani extends StatefulWidget {
   const LisansEkrani({super.key});
@@ -453,11 +650,7 @@ class _LisansEkraniState extends State<LisansEkrani> {
                   const SizedBox(height: 6),
                   SelectableText(
                     _talepKodu,
-                    style: const TextStyle(
-                      fontSize: 24,
-                      fontWeight: FontWeight.bold,
-                      letterSpacing: 1.5,
-                    ),
+                    style: const TextStyle(fontSize: 24, fontWeight: FontWeight.bold, letterSpacing: 1.5),
                   ),
                   const SizedBox(height: 8),
                   TextButton.icon(
@@ -479,10 +672,7 @@ class _LisansEkraniState extends State<LisansEkrani> {
                   const SizedBox(height: 6),
                   const SelectableText(
                     LisansServisi.gelistiriciMail,
-                    style: TextStyle(
-                      fontWeight: FontWeight.bold,
-                      color: Color(0xFF2E5A27),
-                    ),
+                    style: TextStyle(fontWeight: FontWeight.bold, color: Color(0xFF2E5A27)),
                   ),
                 ],
               ),
@@ -511,24 +701,33 @@ class _LisansEkraniState extends State<LisansEkrani> {
 }
 
 // ====================================================================
-// 5. ANA ÖLÇÜM EKRANI (YOLO-TFLITE + ÇİFT REF + ROI + SIFIR ÇAKIŞMA)
+// 6. ANA ÖLÇÜM EKRANI (ÖNCE TESPİT -> 1-5 REF IDW + PARÇALI İSTİF + PDF)
 // ====================================================================
 class TespitEdilenTomruk {
   double xNorm;
   double yNorm;
   double capNorm;
-  double capCm;
+  bool isReferans;
+  double? referansCapCm;
+  double? capCm;
 
   TespitEdilenTomruk({
     required this.xNorm,
     required this.yNorm,
     required this.capNorm,
-    required this.capCm,
+    this.isReferans = false,
+    this.referansCapCm,
+    this.capCm,
   });
 }
 
-enum EtkilesimModu { ref1, ref2, roiAlani, secDuzenle, tomrukEkle }
-enum SeciliHedef { hicbiri, ref1, ref2, tomruk }
+class IstifParcasi {
+  final int parcaNo;
+  final List<int> tamCaplarCm;
+  IstifParcasi({required this.parcaNo, required this.tamCaplarCm});
+}
+
+enum EtkilesimModu { roiAlani, secDuzenle, tomrukEkle }
 
 class KameraOlcumSayfasi extends StatefulWidget {
   const KameraOlcumSayfasi({super.key});
@@ -548,33 +747,23 @@ class _KameraOlcumSayfasiState extends State<KameraOlcumSayfasi> {
   int _fotoYukseklik = 1;
   bool _isleniyor = false;
 
-  Offset? _ref1P1;
-  Offset? _ref1Center;
-  double? _ref1CapNorm;
-  double _ref1CapCm = 25.0;
-  final TextEditingController _ref1CapCtrl = TextEditingController(text: '25');
-
-  Offset? _ref2P1;
-  Offset? _ref2Center;
-  double? _ref2CapNorm;
-  double _ref2CapCm = 25.0;
-  final TextEditingController _ref2CapCtrl = TextEditingController(text: '25');
-
   Offset? _roiP1;
   Rect? _roiNorm;
 
   final List<TespitEdilenTomruk> _tomruklar = [];
-  SeciliHedef _seciliHedef = SeciliHedef.hicbiri;
-  int? _seciliTomrukIdx;
-  EtkilesimModu _mod = EtkilesimModu.ref1;
+  int? _seciliIdx;
+  EtkilesimModu _mod = EtkilesimModu.secDuzenle;
 
+  final TextEditingController _seciliRefCapCtrl = TextEditingController(text: '25');
   double _emvalBoyu = 3.0;
   final TextEditingController _emvalBoyuController = TextEditingController(text: '3.0');
-  final double _varsayilanManuelCapCm = 24.0;
+
+  // Parçalı istif oturumu (çoklu kare birleştirme)
+  final List<IstifParcasi> _istifParcalari = [];
 
   double get _invAspect => _fotoYukseklik / max(1, _fotoGenislik);
-  bool get _ref1Hazir => _ref1Center != null && _ref1CapNorm != null && _ref1CapNorm! > 0.005;
-  bool get _ref2Hazir => _ref2Center != null && _ref2CapNorm != null && _ref2CapNorm! > 0.005;
+  List<TespitEdilenTomruk> get _referanslar =>
+      _tomruklar.where((t) => t.isReferans && t.referansCapCm != null && t.capNorm > 0.004).toList();
 
   @override
   void initState() {
@@ -587,36 +776,10 @@ class _KameraOlcumSayfasiState extends State<KameraOlcumSayfasi> {
   @override
   void dispose() {
     _yolo.kapat();
-    _ref1CapCtrl.dispose();
-    _ref2CapCtrl.dispose();
+    _seciliRefCapCtrl.dispose();
     _emvalBoyuController.dispose();
     _zoomController.dispose();
     super.dispose();
-  }
-
-  double? _olcekHesapla(double xNorm, double yNorm) {
-    if (!_ref1Hazir) return null;
-    final double scale1 = _ref1CapCm / _ref1CapNorm!;
-    if (!_ref2Hazir) return scale1;
-
-    final double scale2 = _ref2CapCm / _ref2CapNorm!;
-    final double vx = _ref2Center!.dx - _ref1Center!.dx;
-    final double vy = (_ref2Center!.dy - _ref1Center!.dy) * _invAspect;
-    final double lenSq = vx * vx + vy * vy;
-    if (lenSq < 1e-6) return (scale1 + scale2) / 2.0;
-
-    final double px = xNorm - _ref1Center!.dx;
-    final double py = (yNorm - _ref1Center!.dy) * _invAspect;
-    final double t = ((px * vx + py * vy) / lenSq).clamp(-0.25, 1.25);
-    return max(5.0, scale1 + t * (scale2 - scale1));
-  }
-
-  void _tumTomrukCaplariniGuncelle() {
-    if (!_ref1Hazir) return;
-    for (final t in _tomruklar) {
-      final sc = _olcekHesapla(t.xNorm, t.yNorm);
-      if (sc != null) t.capCm = t.capNorm * sc;
-    }
   }
 
   void _zoomSifirla() => _zoomController.value = Matrix4.identity();
@@ -628,29 +791,60 @@ class _KameraOlcumSayfasiState extends State<KameraOlcumSayfasi> {
     }
   }
 
-  double _maksimumCakismasizYaricapNorm(double nx, double ny, {int? haricIdx}) {
-    double maxR = 0.5;
-    void kontrolEt(double ox, double oy, double oCapNorm) {
-      final dx = nx - ox;
-      final dy = (ny - oy) * _invAspect;
-      final kalanBosluk = sqrt(dx * dx + dy * dy) - (oCapNorm / 2.0);
-      if (kalanBosluk < maxR) maxR = kalanBosluk;
+  /// 1 ile 5 adet referans tomruğa göre Ters Mesafe Ağırlıklı Enterpolasyon (IDW)
+  double? _idwOlcekHesapla(double xNorm, double yNorm) {
+    final refs = _referanslar;
+    if (refs.isEmpty) return null;
+    if (refs.length == 1) {
+      return refs.first.referansCapCm! / refs.first.capNorm;
     }
 
-    if (_ref1Hazir) kontrolEt(_ref1Center!.dx, _ref1Center!.dy, _ref1CapNorm!);
-    if (_ref2Hazir) kontrolEt(_ref2Center!.dx, _ref2Center!.dy, _ref2CapNorm!);
+    double agirlikliToplam = 0.0;
+    double toplamAgirlik = 0.0;
+    for (final r in refs) {
+      final scaleI = r.referansCapCm! / r.capNorm;
+      final dx = xNorm - r.xNorm;
+      final dy = (yNorm - r.yNorm) * _invAspect;
+      final distSq = dx * dx + dy * dy;
+      final w = 1.0 / (distSq + 0.0005);
+      agirlikliToplam += w * scaleI;
+      toplamAgirlik += w;
+    }
+    return toplamAgirlik > 0 ? agirlikliToplam / toplamAgirlik : null;
+  }
+
+  void _idwCaplariGuncelle() {
+    final refs = _referanslar;
+    for (final t in _tomruklar) {
+      if (t.isReferans && t.referansCapCm != null) {
+        t.capCm = t.referansCapCm!;
+      } else if (refs.isEmpty) {
+        t.capCm = null;
+      } else {
+        final sc = _idwOlcekHesapla(t.xNorm, t.yNorm);
+        t.capCm = sc != null ? t.capNorm * sc : null;
+      }
+    }
+  }
+
+  double _maksimumCakismasizYaricapNorm(double nx, double ny, {int? haricIdx}) {
+    double maxR = 0.5;
     for (int i = 0; i < _tomruklar.length; i++) {
       if (i == haricIdx) continue;
-      kontrolEt(_tomruklar[i].xNorm, _tomruklar[i].yNorm, _tomruklar[i].capNorm);
+      final o = _tomruklar[i];
+      final dx = nx - o.xNorm;
+      final dy = (ny - o.yNorm) * _invAspect;
+      final kalan = sqrt(dx * dx + dy * dy) - (o.capNorm / 2.0);
+      if (kalan < maxR) maxR = kalan;
     }
     return maxR;
   }
 
   Future<void> _fotoAl(ImageSource kaynak) async {
+    // Yüksek çözünürlüğü korumak için maxWidth kısıtı kaldırıldı
     final XFile? dosya = await _picker.pickImage(
       source: kaynak,
-      maxWidth: 1600,
-      imageQuality: 85,
+      imageQuality: 92,
     );
     if (dosya == null) return;
 
@@ -662,18 +856,11 @@ class _KameraOlcumSayfasiState extends State<KameraOlcumSayfasi> {
       _seciliFoto = File(dosya.path);
       _fotoGenislik = decoded?.width ?? 1;
       _fotoYukseklik = decoded?.height ?? 1;
-      _ref1P1 = null;
-      _ref1Center = null;
-      _ref1CapNorm = null;
-      _ref2P1 = null;
-      _ref2Center = null;
-      _ref2CapNorm = null;
       _roiP1 = null;
       _roiNorm = null;
       _tomruklar.clear();
-      _seciliHedef = SeciliHedef.hicbiri;
-      _seciliTomrukIdx = null;
-      _mod = EtkilesimModu.ref1;
+      _seciliIdx = null;
+      _mod = EtkilesimModu.secDuzenle;
     });
   }
 
@@ -711,107 +898,123 @@ class _KameraOlcumSayfasiState extends State<KameraOlcumSayfasi> {
     return closed;
   }
 
-  /// Yedek görüntü işleme motoru (tomruk_model.tflite yoksa devreye girer)
-  List<_AdayDaire> _yedekMotorTespit(img.Image orijinal, double minTargetCm, double maxTargetCm) {
-    const int w = 360;
-    final int h = max(1, (orijinal.height * w / orijinal.width).round());
-    final img.Image kucuk = img.copyResize(orijinal, width: w, height: h);
+  /// Yedek motor: %20 örtüşmeli otomatik yatay dilimleme + morfolojik kapama
+  List<_AdayDaire> _yedekMotorDilimliTespit(img.Image orijinal) {
+    final List<_AdayDaire> tumAdaylar = [];
+    final int dilimSayisi = (orijinal.width / max(1, orijinal.height)) > 1.35 ? 2 : 1;
+    final double ortusme = 0.20;
+    final double dilimOran = dilimSayisi == 1 ? 1.0 : 1.0 / (dilimSayisi - ortusme);
+    final int dilimW = (orijinal.width * dilimOran).round().clamp(1, orijinal.width);
+    final int adimX = dilimSayisi > 1 ? (orijinal.width - dilimW) : 0;
 
-    final int roiMinX = _roiNorm != null ? max(1, (_roiNorm!.left * w).floor()) : 1;
-    final int roiMaxX = _roiNorm != null ? min(w - 2, (_roiNorm!.right * w).ceil()) : w - 2;
-    final int roiMinY = _roiNorm != null ? max(1, (_roiNorm!.top * h).floor()) : 1;
-    final int roiMaxY = _roiNorm != null ? min(h - 2, (_roiNorm!.bottom * h).ceil()) : h - 2;
+    for (int d = 0; d < dilimSayisi; d++) {
+      final int startX = (d * adimX).clamp(0, max(0, orijinal.width - dilimW));
+      final img.Image parca = dilimSayisi == 1
+          ? orijinal
+          : img.copyCrop(orijinal, x: startX, y: 0, width: dilimW, height: orijinal.height);
 
-    List<int> mask = List<int>.filled(w * h, 0);
-    for (int y = roiMinY; y <= roiMaxY; y++) {
-      for (int x = roiMinX; x <= roiMaxX; x++) {
-        final p = kucuk.getPixel(x, y);
-        final r = p.r.toDouble();
-        final g = p.g.toDouble();
-        final b = p.b.toDouble();
-        final luma = 0.299 * r + 0.587 * g + 0.114 * b;
-        final isGreen = g > r + 5 && g > b + 5;
-        final isSky = b > r + 4;
-        if (!isGreen && !isSky && r >= b + 6 && luma > 45 && luma < 245) {
-          mask[y * w + x] = 1;
-        }
-      }
-    }
-    mask = _morfolojikKapama(mask, w, h);
+      const int w = 360;
+      final int h = max(1, (parca.height * w / parca.width).round());
+      final img.Image kucuk = img.copyResize(parca, width: w, height: h);
 
-    final Float64List dist = Float64List(w * h);
-    const double inf = 1e6;
-    for (int i = 0; i < w * h; i++) {
-      dist[i] = mask[i] == 1 ? inf : 0.0;
-    }
-    for (int y = 1; y < h - 1; y++) {
-      for (int x = 1; x < w - 1; x++) {
-        final idx = y * w + x;
-        if (dist[idx] == 0.0) continue;
-        double d = dist[idx];
-        d = min(d, dist[idx - 1] + 1.0);
-        d = min(d, dist[idx - w] + 1.0);
-        d = min(d, dist[idx - w - 1] + 1.414);
-        d = min(d, dist[idx - w + 1] + 1.414);
-        dist[idx] = d;
-      }
-    }
-    for (int y = h - 2; y >= 1; y--) {
-      for (int x = w - 2; x >= 1; x--) {
-        final idx = y * w + x;
-        if (dist[idx] == 0.0) continue;
-        double d = dist[idx];
-        d = min(d, dist[idx + 1] + 1.0);
-        d = min(d, dist[idx + w] + 1.0);
-        d = min(d, dist[idx + w + 1] + 1.414);
-        d = min(d, dist[idx + w - 1] + 1.414);
-        dist[idx] = d;
-      }
-    }
-
-    final List<_AdayDaire> adaylar = [];
-    for (int y = roiMinY + 2; y <= roiMaxY - 2; y++) {
-      for (int x = roiMinX + 2; x <= roiMaxX - 2; x++) {
-        final val = dist[y * w + x];
-        if (val < 3.5) continue;
-        final sc = _olcekHesapla(x / w, y / h)!;
-        final localMinR = (minTargetCm / sc) * w / 2.0;
-        final localMaxR = (maxTargetCm / sc) * w / 2.0;
-        if (val < localMinR || val > localMaxR) continue;
-
-        bool isPeak = true;
-        for (int dy = -2; dy <= 2 && isPeak; dy++) {
-          for (int dx = -2; dx <= 2; dx++) {
-            if (dx == 0 && dy == 0) continue;
-            if (dist[(y + dy) * w + (x + dx)] > val) {
-              isPeak = false;
-              break;
-            }
+      List<int> mask = List<int>.filled(w * h, 0);
+      for (int y = 1; y < h - 1; y++) {
+        for (int x = 1; x < w - 1; x++) {
+          final p = kucuk.getPixel(x, y);
+          final r = p.r.toDouble();
+          final g = p.g.toDouble();
+          final b = p.b.toDouble();
+          final luma = 0.299 * r + 0.587 * g + 0.114 * b;
+          final isGreen = g > r + 5 && g > b + 5;
+          final isSky = b > r + 4;
+          if (!isGreen && !isSky && r >= b + 6 && luma > 45 && luma < 245) {
+            mask[y * w + x] = 1;
           }
         }
-        if (isPeak) {
-          adaylar.add(_AdayDaire(x / w, y / h, (val * 1.05) / w, val));
+      }
+      mask = _morfolojikKapama(mask, w, h);
+
+      final Float64List dist = Float64List(w * h);
+      const double inf = 1e6;
+      for (int i = 0; i < w * h; i++) {
+        dist[i] = mask[i] == 1 ? inf : 0.0;
+      }
+      for (int y = 1; y < h - 1; y++) {
+        for (int x = 1; x < w - 1; x++) {
+          final idx = y * w + x;
+          if (dist[idx] == 0.0) continue;
+          double dd = dist[idx];
+          dd = min(dd, dist[idx - 1] + 1.0);
+          dd = min(dd, dist[idx - w] + 1.0);
+          dd = min(dd, dist[idx - w - 1] + 1.414);
+          dd = min(dd, dist[idx - w + 1] + 1.414);
+          dist[idx] = dd;
+        }
+      }
+      for (int y = h - 2; y >= 1; y--) {
+        for (int x = w - 2; x >= 1; x--) {
+          final idx = y * w + x;
+          if (dist[idx] == 0.0) continue;
+          double dd = dist[idx];
+          dd = min(dd, dist[idx + 1] + 1.0);
+          dd = min(dd, dist[idx + w] + 1.0);
+          dd = min(dd, dist[idx + w + 1] + 1.414);
+          dd = min(dd, dist[idx + w - 1] + 1.414);
+          dist[idx] = dd;
+        }
+      }
+
+      for (int y = 3; y < h - 3; y++) {
+        for (int x = 3; x < w - 3; x++) {
+          final val = dist[y * w + x];
+          if (val < 5.0 || val > w * 0.16) continue;
+
+          bool isPeak = true;
+          for (int dy = -2; dy <= 2 && isPeak; dy++) {
+            for (int dx = -2; dx <= 2; dx++) {
+              if (dx == 0 && dy == 0) continue;
+              if (dist[(y + dy) * w + (x + dx)] > val) {
+                isPeak = false;
+                break;
+              }
+            }
+          }
+          if (!isPeak) continue;
+
+          final int ri = val.round();
+          int toplam = 0, dolu = 0;
+          for (int dy = -ri; dy <= ri; dy += 2) {
+            for (int dx = -ri; dx <= ri; dx += 2) {
+              if (dx * dx + dy * dy <= ri * ri) {
+                final nx = x + dx;
+                final ny = y + dy;
+                if (nx >= 0 && nx < w && ny >= 0 && ny < h) {
+                  toplam++;
+                  if (mask[ny * w + nx] == 1) dolu++;
+                }
+              }
+            }
+          }
+          final doluluk = toplam > 0 ? dolu / toplam : 0.0;
+          if (doluluk >= 0.68) {
+            final gx = (startX + (x / w) * dilimW) / orijinal.width;
+            final gy = y / h;
+            final gr = ((val * 1.05) / w) * (dilimW / orijinal.width);
+            tumAdaylar.add(_AdayDaire(gx.clamp(0.0, 1.0), gy.clamp(0.0, 1.0), gr, val * doluluk));
+          }
         }
       }
     }
-    return adaylar;
+    return tumAdaylar;
   }
 
+  /// ÖNCE TESPİT: Referans beklemeden tüm tomruk çemberlerini otomatik çıkarır
   Future<void> _otomatikTespitCalistir() async {
     if (_seciliFoto == null) return;
-    if (!_ref1Hazir) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text('Önce Ref-1 modunda çapını bildiğiniz tomruğun iki karşı kenarına dokunun.'),
-        ),
-      );
-      return;
-    }
 
     setState(() {
       _isleniyor = true;
-      _seciliHedef = SeciliHedef.hicbiri;
-      _seciliTomrukIdx = null;
+      _seciliIdx = null;
     });
 
     try {
@@ -819,73 +1022,49 @@ class _KameraOlcumSayfasiState extends State<KameraOlcumSayfasi> {
       final img.Image? orijinal = img.decodeImage(bytes);
       if (orijinal == null) return;
 
-      final double refMinCm = _ref2Hazir ? min(_ref1CapCm, _ref2CapCm) : _ref1CapCm;
-      final double refMaxCm = _ref2Hazir ? max(_ref1CapCm, _ref2CapCm) : _ref1CapCm;
-      final double minTargetCm = max(8.0, refMinCm * 0.40);
-      final double maxTargetCm = min(150.0, refMaxCm * 1.75);
-
-      // 1) Öncelik: Açık kaynak YOLO-TFLite modeli; yoksa yedek motor
       List<_AdayDaire> hamAdaylar = _yolo.aktif
-          ? _yolo.tespitEt(orijinal, confEsik: 0.25)
-          : _yedekMotorTespit(orijinal, minTargetCm, maxTargetCm);
+          ? _yolo.dilimliTespitEt(orijinal, confEsik: 0.25)
+          : _yedekMotorDilimliTespit(orijinal);
 
-      // 2) ROI (Alan) filtresi
       if (_roiNorm != null) {
-        hamAdaylar = hamAdaylar
-            .where((a) => _roiNorm!.contains(Offset(a.x, a.y)))
-            .toList();
+        hamAdaylar = hamAdaylar.where((a) => _roiNorm!.contains(Offset(a.x, a.y))).toList();
       }
 
-      // 3) Kilitli Referans Alanları + Kesin Sıfır Çakışma (d >= r1 + r2)
+      // Kesin sıfır çakışma (d >= r1 + r2)
       hamAdaylar.sort((a, b) => b.skor.compareTo(a.skor));
-      final List<_AdayDaire> kilitliler = [
-        _AdayDaire(_ref1Center!.dx, _ref1Center!.dy, _ref1CapNorm! / 2.0, 1e9),
-      ];
-      if (_ref2Hazir) {
-        kilitliler.add(_AdayDaire(_ref2Center!.dx, _ref2Center!.dy, _ref2CapNorm! / 2.0, 1e9));
-      }
-
       final List<_AdayDaire> secilenler = [];
+      const double minRNorm = 0.010;
+
       for (final aday in hamAdaylar) {
-        final sc = _olcekHesapla(aday.x, aday.y)!;
-        final double localMinR = (minTargetCm / sc) / 2.0;
         double izinVerilenMaxR = aday.r;
         bool gecersiz = false;
-
-        for (final s in [...kilitliler, ...secilenler]) {
+        for (final s in secilenler) {
           final dx = aday.x - s.x;
           final dy = (aday.y - s.y) * _invAspect;
-          final kalanBosluk = sqrt(dx * dx + dy * dy) - s.r;
-          if (kalanBosluk < localMinR) {
+          final kalan = sqrt(dx * dx + dy * dy) - s.r;
+          if (kalan < minRNorm) {
             gecersiz = true;
             break;
           }
-          if (kalanBosluk < izinVerilenMaxR) {
-            izinVerilenMaxR = kalanBosluk;
+          if (kalan < izinVerilenMaxR) {
+            izinVerilenMaxR = kalan;
           }
         }
-
-        if (!gecersiz && izinVerilenMaxR >= localMinR) {
+        if (!gecersiz && izinVerilenMaxR >= minRNorm) {
           aday.r = izinVerilenMaxR;
           secilenler.add(aday);
         }
       }
 
-      final List<TespitEdilenTomruk> bulunanlar = [];
-      for (final s in secilenler) {
-        final capNorm = s.r * 2.0;
-        final capCm = capNorm * _olcekHesapla(s.x, s.y)!;
-        if (capCm >= minTargetCm && capCm <= maxTargetCm) {
-          bulunanlar.add(
-            TespitEdilenTomruk(
+      final List<TespitEdilenTomruk> bulunanlar = secilenler
+          .map(
+            (s) => TespitEdilenTomruk(
               xNorm: s.x,
               yNorm: s.y,
-              capNorm: capNorm,
-              capCm: capCm,
+              capNorm: s.r * 2.0,
             ),
-          );
-        }
-      }
+          )
+          .toList();
 
       setState(() {
         _tomruklar
@@ -895,12 +1074,11 @@ class _KameraOlcumSayfasiState extends State<KameraOlcumSayfasi> {
       });
 
       if (mounted) {
-        final motorAdi = _yolo.aktif ? 'YOLO-TFLite AI' : 'Yedek Motor';
-        final int refAdet = (_ref1Hazir ? 1 : 0) + (_ref2Hazir ? 1 : 0);
+        final motor = _yolo.aktif ? 'YOLO-TFLite' : 'Dilimlemeli Yedek';
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
             content: Text(
-              '[$motorAdi] ${bulunanlar.length} yeni + $refAdet referans = ${bulunanlar.length + refAdet} tomruk.',
+              '[$motor] ${bulunanlar.length} tomruk bulundu. Şimdi 1–5 tomruğa dokunup referans çapını (cm) girin.',
             ),
           ),
         );
@@ -910,99 +1088,69 @@ class _KameraOlcumSayfasiState extends State<KameraOlcumSayfasi> {
     }
   }
 
-  void _merkezKaydir(double dxNorm, double dyNorm) {
-    if (_seciliHedef == SeciliHedef.ref1 && _ref1Center != null) {
-      setState(() {
-        _ref1Center = Offset(
-          (_ref1Center!.dx + dxNorm).clamp(0.01, 0.99),
-          (_ref1Center!.dy + dyNorm).clamp(0.01, 0.99),
-        );
-        _tumTomrukCaplariniGuncelle();
-      });
-    } else if (_seciliHedef == SeciliHedef.ref2 && _ref2Center != null) {
-      setState(() {
-        _ref2Center = Offset(
-          (_ref2Center!.dx + dxNorm).clamp(0.01, 0.99),
-          (_ref2Center!.dy + dyNorm).clamp(0.01, 0.99),
-        );
-        _tumTomrukCaplariniGuncelle();
-      });
-    } else if (_seciliHedef == SeciliHedef.tomruk &&
-        _seciliTomrukIdx != null &&
-        _seciliTomrukIdx! < _tomruklar.length) {
-      final t = _tomruklar[_seciliTomrukIdx!];
-      final yeniX = (t.xNorm + dxNorm).clamp(0.01, 0.99);
-      final yeniY = (t.yNorm + dyNorm).clamp(0.01, 0.99);
-      final maxRNorm = _maksimumCakismasizYaricapNorm(yeniX, yeniY, haricIdx: _seciliTomrukIdx);
-      if (t.capNorm / 2.0 > maxRNorm) return;
+  void _seciliTomrukMerkezKaydir(double dxNorm, double dyNorm) {
+    if (_seciliIdx == null || _seciliIdx! >= _tomruklar.length) return;
+    final t = _tomruklar[_seciliIdx!];
+    final yeniX = (t.xNorm + dxNorm).clamp(0.01, 0.99);
+    final yeniY = (t.yNorm + dyNorm).clamp(0.01, 0.99);
+    final maxR = _maksimumCakismasizYaricapNorm(yeniX, yeniY, haricIdx: _seciliIdx);
+    if (t.capNorm / 2.0 > maxR) return;
 
-      setState(() {
-        t.xNorm = yeniX;
-        t.yNorm = yeniY;
-        final sc = _olcekHesapla(yeniX, yeniY);
-        if (sc != null) t.capCm = t.capNorm * sc;
-      });
-    }
+    setState(() {
+      t.xNorm = yeniX;
+      t.yNorm = yeniY;
+      _idwCaplariGuncelle();
+    });
   }
 
-  void _seciliTomrukCapGuncelle(double yeniCapCm) {
-    if (_seciliTomrukIdx == null || _seciliTomrukIdx! >= _tomruklar.length) return;
-    final t = _tomruklar[_seciliTomrukIdx!];
-    double hedefCapCm = yeniCapCm.clamp(6.0, 150.0);
-    final sc = _olcekHesapla(t.xNorm, t.yNorm);
+  void _seciliTomrukCemberBoyutuGuncelle(double yeniCapNorm) {
+    if (_seciliIdx == null || _seciliIdx! >= _tomruklar.length) return;
+    final t = _tomruklar[_seciliIdx!];
+    final maxR = _maksimumCakismasizYaricapNorm(t.xNorm, t.yNorm, haricIdx: _seciliIdx);
+    final hedef = yeniCapNorm.clamp(0.015, max(0.015, min(0.45, maxR * 2.0)));
+    setState(() {
+      t.capNorm = hedef;
+      _idwCaplariGuncelle();
+    });
+  }
 
-    if (sc != null && sc > 0) {
-      final maxRNorm = _maksimumCakismasizYaricapNorm(t.xNorm, t.yNorm, haricIdx: _seciliTomrukIdx);
-      final maxCapCm = max(6.0, (maxRNorm * 2.0) * sc);
-      if (hedefCapCm > maxCapCm) hedefCapCm = maxCapCm;
-      setState(() {
-        t.capCm = hedefCapCm;
-        t.capNorm = hedefCapCm / sc;
-      });
-    } else {
-      setState(() => t.capCm = hedefCapCm);
+  void _seciliTomruguReferansYap() {
+    if (_seciliIdx == null || _seciliIdx! >= _tomruklar.length) return;
+    final t = _tomruklar[_seciliIdx!];
+    if (!t.isReferans && _referanslar.length >= 5) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('En fazla 5 adet referans tomruk tanımlayabilirsiniz.')),
+      );
+      return;
     }
+    final girilen = double.tryParse(_seciliRefCapCtrl.text.replaceAll(',', '.'));
+    if (girilen == null || girilen < 5 || girilen > 200) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Geçerli bir çap değeri girin (5 - 200 cm).')),
+      );
+      return;
+    }
+    setState(() {
+      t.isReferans = true;
+      t.referansCapCm = girilen;
+      _idwCaplariGuncelle();
+    });
+  }
+
+  void _seciliTomrukReferansiKaldir() {
+    if (_seciliIdx == null || _seciliIdx! >= _tomruklar.length) return;
+    setState(() {
+      _tomruklar[_seciliIdx!].isReferans = false;
+      _tomruklar[_seciliIdx!].referansCapCm = null;
+      _idwCaplariGuncelle();
+    });
   }
 
   void _fotoyaDokunuldu(TapDownDetails details, Size widgetSize) {
     final nx = (details.localPosition.dx / widgetSize.width).clamp(0.0, 1.0);
     final ny = (details.localPosition.dy / widgetSize.height).clamp(0.0, 1.0);
 
-    if (_mod == EtkilesimModu.ref1) {
-      setState(() {
-        _seciliHedef = SeciliHedef.hicbiri;
-        if (_ref1P1 == null) {
-          _ref1P1 = Offset(nx, ny);
-        } else {
-          final dx = nx - _ref1P1!.dx;
-          final dy = (ny - _ref1P1!.dy) * _invAspect;
-          final capN = sqrt(dx * dx + dy * dy);
-          if (capN >= 0.008) {
-            _ref1Center = Offset((_ref1P1!.dx + nx) / 2.0, (_ref1P1!.dy + ny) / 2.0);
-            _ref1CapNorm = capN;
-            _tumTomrukCaplariniGuncelle();
-          }
-          _ref1P1 = null;
-        }
-      });
-    } else if (_mod == EtkilesimModu.ref2) {
-      setState(() {
-        _seciliHedef = SeciliHedef.hicbiri;
-        if (_ref2P1 == null) {
-          _ref2P1 = Offset(nx, ny);
-        } else {
-          final dx = nx - _ref2P1!.dx;
-          final dy = (ny - _ref2P1!.dy) * _invAspect;
-          final capN = sqrt(dx * dx + dy * dy);
-          if (capN >= 0.008) {
-            _ref2Center = Offset((_ref2P1!.dx + nx) / 2.0, (_ref2P1!.dy + ny) / 2.0);
-            _ref2CapNorm = capN;
-            _tumTomrukCaplariniGuncelle();
-          }
-          _ref2P1 = null;
-        }
-      });
-    } else if (_mod == EtkilesimModu.roiAlani) {
+    if (_mod == EtkilesimModu.roiAlani) {
       setState(() {
         if (_roiP1 == null) {
           _roiP1 = Offset(nx, ny);
@@ -1013,41 +1161,25 @@ class _KameraOlcumSayfasiState extends State<KameraOlcumSayfasi> {
       });
     } else if (_mod == EtkilesimModu.secDuzenle) {
       double minMesafe = 0.08;
-      SeciliHedef hedef = SeciliHedef.hicbiri;
       int? enYakinIdx;
-
-      if (_ref1Hazir) {
-        final d = sqrt(pow(_ref1Center!.dx - nx, 2) + pow((_ref1Center!.dy - ny) * _invAspect, 2));
-        if (d < minMesafe) {
-          minMesafe = d;
-          hedef = SeciliHedef.ref1;
-        }
-      }
-      if (_ref2Hazir) {
-        final d = sqrt(pow(_ref2Center!.dx - nx, 2) + pow((_ref2Center!.dy - ny) * _invAspect, 2));
-        if (d < minMesafe) {
-          minMesafe = d;
-          hedef = SeciliHedef.ref2;
-        }
-      }
       for (int i = 0; i < _tomruklar.length; i++) {
         final d = sqrt(pow(_tomruklar[i].xNorm - nx, 2) + pow((_tomruklar[i].yNorm - ny) * _invAspect, 2));
         if (d < minMesafe) {
           minMesafe = d;
-          hedef = SeciliHedef.tomruk;
           enYakinIdx = i;
         }
       }
       setState(() {
-        _seciliHedef = hedef;
-        _seciliTomrukIdx = hedef == SeciliHedef.tomruk ? enYakinIdx : null;
+        _seciliIdx = enYakinIdx;
+        if (enYakinIdx != null) {
+          final sel = _tomruklar[enYakinIdx];
+          final gosterilecek = sel.referansCapCm ?? sel.capCm ?? 25.0;
+          _seciliRefCapCtrl.text = gosterilecek.floor().toString();
+        }
       });
     } else if (_mod == EtkilesimModu.tomrukEkle) {
-      final sc = _olcekHesapla(nx, ny);
-      final maxRNorm = _maksimumCakismasizYaricapNorm(nx, ny);
-      final minRNorm = (sc != null && sc > 0) ? (6.0 / sc) / 2.0 : 0.015;
-
-      if (maxRNorm < minRNorm) {
+      final maxR = _maksimumCakismasizYaricapNorm(nx, ny);
+      if (maxR < 0.010) {
         ScaffoldMessenger.of(context).showSnackBar(
           const SnackBar(
             content: Text('Bu alan mevcut bir tomrukla çakışıyor; boş bir merkeze dokunun.'),
@@ -1056,30 +1188,77 @@ class _KameraOlcumSayfasiState extends State<KameraOlcumSayfasi> {
         );
         return;
       }
-
-      final istenenCapNorm = sc != null ? _varsayilanManuelCapCm / sc : 0.06;
-      final gercekCapNorm = min(istenenCapNorm, maxRNorm * 2.0);
-      final gercekCapCm = sc != null ? gercekCapNorm * sc : _varsayilanManuelCapCm;
-
+      final varsayilanCapNorm = min(0.06, maxR * 2.0);
       setState(() {
         _tomruklar.add(
-          TespitEdilenTomruk(
-            xNorm: nx,
-            yNorm: ny,
-            capNorm: gercekCapNorm,
-            capCm: gercekCapCm,
-          ),
+          TespitEdilenTomruk(xNorm: nx, yNorm: ny, capNorm: varsayilanCapNorm),
         );
-        _seciliHedef = SeciliHedef.tomruk;
-        _seciliTomrukIdx = _tomruklar.length - 1;
+        _seciliIdx = _tomruklar.length - 1;
+        _idwCaplariGuncelle();
+        final sel = _tomruklar[_seciliIdx!];
+        _seciliRefCapCtrl.text = (sel.capCm ?? 25.0).floor().toString();
       });
     }
   }
 
-  double _netHacimHesapla(double capCm) {
-    final int tamCapCm = capCm.floor();
+  List<int> _mevcutKareTamCaplar() {
+    return _tomruklar
+        .where((t) => t.capCm != null && t.capCm! >= 5.0)
+        .map((t) => t.capCm!.floor())
+        .toList();
+  }
+
+  void _mevcutKareyiIstifeEkle() {
+    final caplar = _mevcutKareTamCaplar();
+    if (caplar.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('İstife eklemek için önce en az 1 referans tomruk tanımlayın.')),
+      );
+      return;
+    }
+    setState(() {
+      _istifParcalari.add(
+        IstifParcasi(parcaNo: _istifParcalari.length + 1, tamCaplarCm: caplar),
+      );
+    });
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text('Parça ${_istifParcalari.length} (${caplar.length} adet) istife eklendi. Yeni kare çekebilirsiniz.'),
+      ),
+    );
+  }
+
+  double _netHacimHesapla(int tamCapCm) {
     final rMetre = (tamCapCm / 100.0) / 2.0;
     return pi * rMetre * rMetre * _emvalBoyu;
+  }
+
+  Future<void> _pdfDokumAl() async {
+    final List<int> raporCaplar = [];
+    int parcaSayisi = 0;
+
+    if (_istifParcalari.isNotEmpty) {
+      for (final p in _istifParcalari) {
+        raporCaplar.addAll(p.tamCaplarCm);
+      }
+      parcaSayisi = _istifParcalari.length;
+    } else {
+      raporCaplar.addAll(_mevcutKareTamCaplar());
+      parcaSayisi = 1;
+    }
+
+    if (raporCaplar.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('PDF oluşturmak için önce tespit yapıp en az 1 referans çap girin.')),
+      );
+      return;
+    }
+
+    await PdfRaporServisi.raporOlusturVePaylas(
+      tamCaplarCm: raporCaplar,
+      emvalBoyuM: _emvalBoyu,
+      parcaSayisi: parcaSayisi,
+    );
   }
 
   Widget _yonTuslari() {
@@ -1091,22 +1270,22 @@ class _KameraOlcumSayfasiState extends State<KameraOlcumSayfasi> {
         IconButton(
           visualDensity: VisualDensity.compact,
           icon: const Icon(Icons.arrow_back),
-          onPressed: () => _merkezKaydir(-adim, 0),
+          onPressed: () => _seciliTomrukMerkezKaydir(-adim, 0),
         ),
         IconButton(
           visualDensity: VisualDensity.compact,
           icon: const Icon(Icons.arrow_upward),
-          onPressed: () => _merkezKaydir(0, -adim),
+          onPressed: () => _seciliTomrukMerkezKaydir(0, -adim),
         ),
         IconButton(
           visualDensity: VisualDensity.compact,
           icon: const Icon(Icons.arrow_downward),
-          onPressed: () => _merkezKaydir(0, adim),
+          onPressed: () => _seciliTomrukMerkezKaydir(0, adim),
         ),
         IconButton(
           visualDensity: VisualDensity.compact,
           icon: const Icon(Icons.arrow_forward),
-          onPressed: () => _merkezKaydir(adim, 0),
+          onPressed: () => _seciliTomrukMerkezKaydir(adim, 0),
         ),
       ],
     );
@@ -1114,21 +1293,18 @@ class _KameraOlcumSayfasiState extends State<KameraOlcumSayfasi> {
 
   @override
   Widget build(BuildContext context) {
-    final List<double> tumCaplar = [
-      if (_ref1Hazir) _ref1CapCm,
-      if (_ref2Hazir) _ref2CapCm,
-      ..._tomruklar.map((t) => t.capCm),
-    ];
-    final toplamHacim = tumCaplar.fold(0.0, (s, c) => s + _netHacimHesapla(c));
-    final ince = tumCaplar.where((c) => c.floor() < 20).length;
-    final orta = tumCaplar.where((c) => c.floor() >= 20 && c.floor() < 30).length;
-    final kalin = tumCaplar.where((c) => c.floor() >= 30).length;
+    final mevcutCaplar = _mevcutKareTamCaplar();
+    final mevcutHacim = mevcutCaplar.fold(0.0, (s, c) => s + _netHacimHesapla(c));
 
-    final seciliTomruk = (_seciliHedef == SeciliHedef.tomruk &&
-            _seciliTomrukIdx != null &&
-            _seciliTomrukIdx! < _tomruklar.length)
-        ? _tomruklar[_seciliTomrukIdx!]
-        : null;
+    final List<int> genelCaplar = _istifParcalari.isNotEmpty
+        ? _istifParcalari.expand((p) => p.tamCaplarCm).toList()
+        : mevcutCaplar;
+    final genelHacim = genelCaplar.fold(0.0, (s, c) => s + _netHacimHesapla(c));
+    final ince = genelCaplar.where((c) => c < 20).length;
+    final orta = genelCaplar.where((c) => c >= 20 && c < 30).length;
+    final kalin = genelCaplar.where((c) => c >= 30).length;
+
+    final secili = (_seciliIdx != null && _seciliIdx! < _tomruklar.length) ? _tomruklar[_seciliIdx!] : null;
 
     return Scaffold(
       appBar: AppBar(
@@ -1139,7 +1315,9 @@ class _KameraOlcumSayfasiState extends State<KameraOlcumSayfasi> {
             children: [
               const Text('TomrukOlcumAI', style: TextStyle(fontSize: 18)),
               Text(
-                _yoloHazir ? 'Motor: YOLO-TFLite AI (Aktif)' : 'Motor: Yedek (Model Bekleniyor)',
+                _yoloHazir
+                    ? 'AI: YOLO-TFLite | Ref: ${_referanslar.length}/5'
+                    : 'Motor: Dilimlemeli | Ref: ${_referanslar.length}/5',
                 style: const TextStyle(fontSize: 11),
               ),
             ],
@@ -1149,7 +1327,7 @@ class _KameraOlcumSayfasiState extends State<KameraOlcumSayfasi> {
         actions: [
           if (_roiNorm != null)
             IconButton(
-              tooltip: 'Çerçeveyi Temizle',
+              tooltip: 'Alan Çerçevesini Temizle',
               icon: const Icon(Icons.crop_free),
               onPressed: () => setState(() {
                 _roiNorm = null;
@@ -1173,7 +1351,7 @@ class _KameraOlcumSayfasiState extends State<KameraOlcumSayfasi> {
                 child: FilledButton.icon(
                   onPressed: () => _fotoAl(ImageSource.camera),
                   icon: const Icon(Icons.camera_alt),
-                  label: const Text('Kamera ile Çek'),
+                  label: const Text('Kamera'),
                 ),
               ),
               const SizedBox(width: 8),
@@ -1181,9 +1359,23 @@ class _KameraOlcumSayfasiState extends State<KameraOlcumSayfasi> {
                 child: OutlinedButton.icon(
                   onPressed: () => _fotoAl(ImageSource.gallery),
                   icon: const Icon(Icons.photo_library),
-                  label: const Text('Galeriden Seç'),
+                  label: const Text('Galeri'),
                 ),
               ),
+              if (_seciliFoto != null) ...[
+                const SizedBox(width: 8),
+                FilledButton.tonalIcon(
+                  onPressed: _isleniyor ? null : _otomatikTespitCalistir,
+                  icon: _isleniyor
+                      ? const SizedBox(
+                          width: 16,
+                          height: 16,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        )
+                      : const Icon(Icons.auto_awesome),
+                  label: const Text('Say'),
+                ),
+              ],
             ],
           ),
           const SizedBox(height: 10),
@@ -1211,20 +1403,10 @@ class _KameraOlcumSayfasiState extends State<KameraOlcumSayfasi> {
                               Image.file(_seciliFoto!, fit: BoxFit.fill),
                               CustomPaint(
                                 painter: _OlcumOverlayPainter(
-                                  ref1P1: _ref1P1,
-                                  ref1Center: _ref1Center,
-                                  ref1CapNorm: _ref1CapNorm,
-                                  ref1CapCm: _ref1CapCm,
-                                  ref1Secili: _seciliHedef == SeciliHedef.ref1,
-                                  ref2P1: _ref2P1,
-                                  ref2Center: _ref2Center,
-                                  ref2CapNorm: _ref2CapNorm,
-                                  ref2CapCm: _ref2CapCm,
-                                  ref2Secili: _seciliHedef == SeciliHedef.ref2,
                                   roiP1: _roiP1,
                                   roiNorm: _roiNorm,
                                   tomruklar: _tomruklar,
-                                  seciliIdx: _seciliTomrukIdx,
+                                  seciliIdx: _seciliIdx,
                                 ),
                               ),
                             ],
@@ -1237,255 +1419,174 @@ class _KameraOlcumSayfasiState extends State<KameraOlcumSayfasi> {
               ),
             ),
             const SizedBox(height: 6),
-            SingleChildScrollView(
-              scrollDirection: Axis.horizontal,
-              child: SegmentedButton<EtkilesimModu>(
-                segments: const [
-                  ButtonSegment(value: EtkilesimModu.ref1, label: Text('Ref-1')),
-                  ButtonSegment(value: EtkilesimModu.ref2, label: Text('Ref-2')),
-                  ButtonSegment(value: EtkilesimModu.roiAlani, label: Text('Alan')),
-                  ButtonSegment(value: EtkilesimModu.secDuzenle, label: Text('Düzenle')),
-                  ButtonSegment(value: EtkilesimModu.tomrukEkle, label: Text('Ekle')),
-                ],
-                selected: {_mod},
-                onSelectionChanged: (s) => setState(() => _mod = s.first),
-              ),
-            ),
-            if (_seciliHedef == SeciliHedef.ref1 && _ref1Hazir) ...[
-              const SizedBox(height: 8),
-              Card(
-                color: Colors.red.shade50,
-                child: Padding(
-                  padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-                  child: Column(
-                    children: [
-                      Text(
-                        'Ref-1 (Kırmızı - ${_ref1CapCm.floor()} cm) İnce Ayar',
-                        style: const TextStyle(fontWeight: FontWeight.bold, color: Colors.red),
-                      ),
-                      _yonTuslari(),
-                      Row(
-                        children: [
-                          IconButton(
-                            icon: const Icon(Icons.remove_circle_outline, color: Colors.red),
-                            onPressed: () => setState(() {
-                              _ref1CapNorm = (_ref1CapNorm! - 0.003).clamp(0.015, 0.50);
-                              _tumTomrukCaplariniGuncelle();
-                            }),
-                          ),
-                          Expanded(
-                            child: Slider(
-                              activeColor: Colors.red,
-                              value: _ref1CapNorm!.clamp(0.015, 0.50),
-                              min: 0.015,
-                              max: 0.50,
-                              onChanged: (v) => setState(() {
-                                _ref1CapNorm = v;
-                                _tumTomrukCaplariniGuncelle();
-                              }),
-                            ),
-                          ),
-                          IconButton(
-                            icon: const Icon(Icons.add_circle_outline, color: Colors.red),
-                            onPressed: () => setState(() {
-                              _ref1CapNorm = (_ref1CapNorm! + 0.003).clamp(0.015, 0.50);
-                              _tumTomrukCaplariniGuncelle();
-                            }),
-                          ),
-                        ],
-                      ),
-                    ],
-                  ),
-                ),
-              ),
-            ],
-            if (_seciliHedef == SeciliHedef.ref2 && _ref2Hazir) ...[
-              const SizedBox(height: 8),
-              Card(
-                color: Colors.orange.shade50,
-                child: Padding(
-                  padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-                  child: Column(
-                    children: [
-                      Row(
-                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                        children: [
-                          Text(
-                            'Ref-2 (Turuncu - ${_ref2CapCm.floor()} cm) İnce Ayar',
-                            style: TextStyle(fontWeight: FontWeight.bold, color: Colors.orange.shade900),
-                          ),
-                          IconButton(
-                            icon: const Icon(Icons.delete, color: Colors.red),
-                            onPressed: () => setState(() {
-                              _ref2Center = null;
-                              _ref2CapNorm = null;
-                              _seciliHedef = SeciliHedef.hicbiri;
-                              _tumTomrukCaplariniGuncelle();
-                            }),
-                          ),
-                        ],
-                      ),
-                      _yonTuslari(),
-                      Row(
-                        children: [
-                          IconButton(
-                            icon: Icon(Icons.remove_circle_outline, color: Colors.orange.shade900),
-                            onPressed: () => setState(() {
-                              _ref2CapNorm = (_ref2CapNorm! - 0.003).clamp(0.015, 0.50);
-                              _tumTomrukCaplariniGuncelle();
-                            }),
-                          ),
-                          Expanded(
-                            child: Slider(
-                              activeColor: Colors.orange,
-                              value: _ref2CapNorm!.clamp(0.015, 0.50),
-                              min: 0.015,
-                              max: 0.50,
-                              onChanged: (v) => setState(() {
-                                _ref2CapNorm = v;
-                                _tumTomrukCaplariniGuncelle();
-                              }),
-                            ),
-                          ),
-                          IconButton(
-                            icon: Icon(Icons.add_circle_outline, color: Colors.orange.shade900),
-                            onPressed: () => setState(() {
-                              _ref2CapNorm = (_ref2CapNorm! + 0.003).clamp(0.015, 0.50);
-                              _tumTomrukCaplariniGuncelle();
-                            }),
-                          ),
-                        ],
-                      ),
-                    ],
-                  ),
-                ),
-              ),
-            ],
-            if (seciliTomruk != null) ...[
-              const SizedBox(height: 8),
-              Card(
-                color: Theme.of(context).colorScheme.secondaryContainer,
-                child: Padding(
-                  padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-                  child: Column(
-                    children: [
-                      Row(
-                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                        children: [
-                          Text(
-                            'Seçili Çap: ${seciliTomruk.capCm.floor()} cm (Ham: ${seciliTomruk.capCm.toStringAsFixed(1)})',
-                            style: const TextStyle(fontWeight: FontWeight.bold),
-                          ),
-                          IconButton(
-                            icon: const Icon(Icons.delete, color: Colors.red),
-                            onPressed: () => setState(() {
-                              _tomruklar.removeAt(_seciliTomrukIdx!);
-                              _seciliTomrukIdx = null;
-                              _seciliHedef = SeciliHedef.hicbiri;
-                            }),
-                          ),
-                        ],
-                      ),
-                      _yonTuslari(),
-                      Row(
-                        children: [
-                          IconButton(
-                            icon: const Icon(Icons.remove_circle_outline),
-                            onPressed: () => _seciliTomrukCapGuncelle(seciliTomruk.capCm - 1.0),
-                          ),
-                          Expanded(
-                            child: Slider(
-                              value: seciliTomruk.capCm.clamp(6.0, 100.0),
-                              min: 6.0,
-                              max: 100.0,
-                              divisions: 94,
-                              label: '${seciliTomruk.capCm.floor()} cm',
-                              onChanged: _seciliTomrukCapGuncelle,
-                            ),
-                          ),
-                          IconButton(
-                            icon: const Icon(Icons.add_circle_outline),
-                            onPressed: () => _seciliTomrukCapGuncelle(seciliTomruk.capCm + 1.0),
-                          ),
-                        ],
-                      ),
-                    ],
-                  ),
-                ),
-              ),
-            ],
-            const SizedBox(height: 8),
-            Row(
-              children: [
-                Expanded(
-                  child: TextField(
-                    controller: _ref1CapCtrl,
-                    keyboardType: const TextInputType.numberWithOptions(decimal: true),
-                    decoration: const InputDecoration(
-                      labelText: 'Ref-1 Çap (cm)',
-                      border: OutlineInputBorder(),
-                      isDense: true,
-                    ),
-                    onChanged: (v) {
-                      final d = double.tryParse(v.replaceAll(',', '.'));
-                      if (d != null && d >= 5 && d <= 200) {
-                        setState(() {
-                          _ref1CapCm = d;
-                          _tumTomrukCaplariniGuncelle();
-                        });
-                      }
-                    },
-                  ),
-                ),
-                const SizedBox(width: 8),
-                Expanded(
-                  child: TextField(
-                    controller: _ref2CapCtrl,
-                    keyboardType: const TextInputType.numberWithOptions(decimal: true),
-                    decoration: const InputDecoration(
-                      labelText: 'Ref-2 Çap (Ops.)',
-                      border: OutlineInputBorder(),
-                      isDense: true,
-                    ),
-                    onChanged: (v) {
-                      final d = double.tryParse(v.replaceAll(',', '.'));
-                      if (d != null && d >= 5 && d <= 200) {
-                        setState(() {
-                          _ref2CapCm = d;
-                          _tumTomrukCaplariniGuncelle();
-                        });
-                      }
-                    },
-                  ),
-                ),
-                const SizedBox(width: 8),
-                FilledButton.tonalIcon(
-                  onPressed: _isleniyor ? null : _otomatikTespitCalistir,
-                  icon: _isleniyor
-                      ? const SizedBox(
-                          width: 16,
-                          height: 16,
-                          child: CircularProgressIndicator(strokeWidth: 2),
-                        )
-                      : const Icon(Icons.auto_awesome),
-                  label: const Text('Say'),
-                ),
+            SegmentedButton<EtkilesimModu>(
+              segments: const [
+                ButtonSegment(value: EtkilesimModu.roiAlani, label: Text('1. Alan')),
+                ButtonSegment(value: EtkilesimModu.secDuzenle, label: Text('2. Düzenle / Ref')),
+                ButtonSegment(value: EtkilesimModu.tomrukEkle, label: Text('3. Ekle')),
               ],
+              selected: {_mod},
+              onSelectionChanged: (s) => setState(() => _mod = s.first),
             ),
+            if (secili != null) ...[
+              const SizedBox(height: 8),
+              Card(
+                color: secili.isReferans
+                    ? Colors.red.shade50
+                    : Theme.of(context).colorScheme.secondaryContainer,
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                  child: Column(
+                    children: [
+                      Row(
+                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                        children: [
+                          Text(
+                            secili.isReferans
+                                ? 'REFERANS TOMRUK (${secili.referansCapCm!.floor()} cm)'
+                                : secili.capCm != null
+                                    ? 'Seçili Çap: ${secili.capCm!.floor()} cm (Ham: ${secili.capCm!.toStringAsFixed(1)})'
+                                    : 'Seçili Tomruk (Referans bekleniyor)',
+                            style: TextStyle(
+                              fontWeight: FontWeight.bold,
+                              color: secili.isReferans ? Colors.red.shade800 : null,
+                            ),
+                          ),
+                          IconButton(
+                            tooltip: 'Sil',
+                            icon: const Icon(Icons.delete, color: Colors.red),
+                            onPressed: () => setState(() {
+                              _tomruklar.removeAt(_seciliIdx!);
+                              _seciliIdx = null;
+                              _idwCaplariGuncelle();
+                            }),
+                          ),
+                        ],
+                      ),
+                      _yonTuslari(),
+                      Row(
+                        children: [
+                          const Text('Çember:', style: TextStyle(fontSize: 12)),
+                          IconButton(
+                            visualDensity: VisualDensity.compact,
+                            icon: const Icon(Icons.remove_circle_outline),
+                            onPressed: () => _seciliTomrukCemberBoyutuGuncelle(secili.capNorm - 0.004),
+                          ),
+                          Expanded(
+                            child: Slider(
+                              value: secili.capNorm.clamp(0.015, 0.45),
+                              min: 0.015,
+                              max: 0.45,
+                              onChanged: _seciliTomrukCemberBoyutuGuncelle,
+                            ),
+                          ),
+                          IconButton(
+                            visualDensity: VisualDensity.compact,
+                            icon: const Icon(Icons.add_circle_outline),
+                            onPressed: () => _seciliTomrukCemberBoyutuGuncelle(secili.capNorm + 0.004),
+                          ),
+                        ],
+                      ),
+                      const Divider(height: 12),
+                      Row(
+                        children: [
+                          Expanded(
+                            child: TextField(
+                              controller: _seciliRefCapCtrl,
+                              keyboardType: const TextInputType.numberWithOptions(decimal: true),
+                              decoration: const InputDecoration(
+                                labelText: 'Gerçek Çap (cm)',
+                                border: OutlineInputBorder(),
+                                isDense: true,
+                              ),
+                            ),
+                          ),
+                          const SizedBox(width: 8),
+                          FilledButton(
+                            style: FilledButton.styleFrom(backgroundColor: Colors.red.shade700),
+                            onPressed: _seciliTomruguReferansYap,
+                            child: Text(secili.isReferans ? 'Ref Güncelle' : 'Referans Yap'),
+                          ),
+                          if (secili.isReferans) ...[
+                            const SizedBox(width: 4),
+                            IconButton(
+                              tooltip: 'Referansı Kaldır',
+                              icon: const Icon(Icons.link_off),
+                              onPressed: _seciliTomrukReferansiKaldir,
+                            ),
+                          ],
+                        ],
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ],
           ] else
             const Card(
               child: Padding(
                 padding: EdgeInsets.all(20),
                 child: Text(
-                  'Başlamak için "Kamera ile Çek" veya "Galeriden Seç" butonuna basın.\n\n'
-                  '1) Ref-1 modunda çapını bildiğiniz tomruğun 2 karşı kenarına dokunun.\n'
-                  '2) (Opsiyonel) Uzak uçta Ref-2 işaretleyin ve Alan çerçevesi çizin.\n'
-                  '3) "Say" butonuna basın.',
+                  '1) Kamera veya Galeriden istif fotoğrafını seçin.\n'
+                  '2) (Opsiyonel) Alan modunda 2 köşeye dokunup istifi çerçeveleyin.\n'
+                  '3) "Say" butonuna basın (otomatik dilimlemeli tespit).\n'
+                  '4) Bulunan tomruklardan 1–5 tanesine dokunup gerçek çapını girin (IDW enterpolasyon).\n'
+                  '5) Uzun istiflerde "İstife Ekle" ile parçaları birleştirip "PDF Döküm Al" butonuna basın.',
                   textAlign: TextAlign.center,
                 ),
               ),
             ),
           const SizedBox(height: 10),
+          // Çoklu Kare / Parçalı İstif Kontrolü
+          if (_seciliFoto != null || _istifParcalari.isNotEmpty)
+            Card(
+              child: Padding(
+                padding: const EdgeInsets.all(10),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Row(
+                      children: [
+                        Expanded(
+                          child: OutlinedButton.icon(
+                            onPressed: _mevcutKareyiIstifeEkle,
+                            icon: const Icon(Icons.playlist_add),
+                            label: const Text('Bu Kareyi İstife Ekle'),
+                          ),
+                        ),
+                        const SizedBox(width: 8),
+                        Expanded(
+                          child: FilledButton.icon(
+                            onPressed: _pdfDokumAl,
+                            icon: const Icon(Icons.picture_as_pdf),
+                            label: const Text('PDF Döküm Al'),
+                          ),
+                        ),
+                      ],
+                    ),
+                    if (_istifParcalari.isNotEmpty) ...[
+                      const SizedBox(height: 8),
+                      Wrap(
+                        spacing: 6,
+                        runSpacing: 4,
+                        children: [
+                          for (int i = 0; i < _istifParcalari.length; i++)
+                            InputChip(
+                              label: Text('Parça ${i + 1}: ${_istifParcalari[i].tamCaplarCm.length} ad.'),
+                              onDeleted: () => setState(() => _istifParcalari.removeAt(i)),
+                            ),
+                          ActionChip(
+                            label: const Text('İstifi Sıfırla'),
+                            onPressed: () => setState(() => _istifParcalari.clear()),
+                          ),
+                        ],
+                      ),
+                    ],
+                  ],
+                ),
+              ),
+            ),
+          const SizedBox(height: 8),
           Card(
             child: Padding(
               padding: const EdgeInsets.all(12),
@@ -1497,19 +1598,28 @@ class _KameraOlcumSayfasiState extends State<KameraOlcumSayfasi> {
                     keyboardType: const TextInputType.numberWithOptions(decimal: true),
                     decoration: const InputDecoration(
                       labelText: 'Emval Boyu (m)',
-                      helperText: 'Klavyeden istediğiniz boyu metre cinsinden girin (örn: 2.5, 3.0, 4.2)',
+                      helperText: 'Klavyeden metre cinsinden girin (örn: 2.5, 3.0, 4.2)',
                       border: OutlineInputBorder(),
                       isDense: true,
                     ),
                     onChanged: _emvalBoyuDegisti,
                   ),
-                  const Divider(height: 20),
+                  const Divider(height: 18),
+                  if (_istifParcalari.isNotEmpty) ...[
+                    Text(
+                      'Bu Kare: ${mevcutCaplar.length} adet | ${mevcutHacim.toStringAsFixed(3)} m³',
+                      style: const TextStyle(fontSize: 13, color: Colors.black87),
+                    ),
+                    const SizedBox(height: 4),
+                  ],
                   Text(
-                    'Toplam Adet: ${tumCaplar.length}',
+                    _istifParcalari.isNotEmpty
+                        ? 'TOPLAM İSTİF (${_istifParcalari.length} Parça): ${genelCaplar.length} Adet'
+                        : 'Toplam Adet: ${genelCaplar.length} (Tespit: ${_tomruklar.length})',
                     style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
                   ),
                   Text(
-                    'Toplam Net Hacim (Kabuksuz): ${toplamHacim.toStringAsFixed(3)} m³',
+                    'Toplam Net Hacim (Kabuksuz): ${genelHacim.toStringAsFixed(3)} m³',
                     style: const TextStyle(fontSize: 15, fontWeight: FontWeight.bold),
                   ),
                   const SizedBox(height: 4),
@@ -1525,81 +1635,17 @@ class _KameraOlcumSayfasiState extends State<KameraOlcumSayfasi> {
 }
 
 class _OlcumOverlayPainter extends CustomPainter {
-  final Offset? ref1P1;
-  final Offset? ref1Center;
-  final double? ref1CapNorm;
-  final double ref1CapCm;
-  final bool ref1Secili;
-  final Offset? ref2P1;
-  final Offset? ref2Center;
-  final double? ref2CapNorm;
-  final double ref2CapCm;
-  final bool ref2Secili;
   final Offset? roiP1;
   final Rect? roiNorm;
   final List<TespitEdilenTomruk> tomruklar;
   final int? seciliIdx;
 
   _OlcumOverlayPainter({
-    required this.ref1P1,
-    required this.ref1Center,
-    required this.ref1CapNorm,
-    required this.ref1CapCm,
-    required this.ref1Secili,
-    required this.ref2P1,
-    required this.ref2Center,
-    required this.ref2CapNorm,
-    required this.ref2CapCm,
-    required this.ref2Secili,
     required this.roiP1,
     required this.roiNorm,
     required this.tomruklar,
     required this.seciliIdx,
   });
-
-  void _cizReferans(
-    Canvas canvas,
-    Size size,
-    Offset? p1,
-    Offset? centerNorm,
-    double? capNorm,
-    double capCm,
-    Color renk,
-    String etiket,
-    bool secili,
-  ) {
-    if (centerNorm != null && capNorm != null) {
-      final c = Offset(centerNorm.dx * size.width, centerNorm.dy * size.height);
-      final r = max(4.0, (capNorm * size.width) / 2.0);
-      canvas.drawCircle(
-        c,
-        r,
-        Paint()
-          ..color = renk
-          ..strokeWidth = secili ? 3.5 : 2.5
-          ..style = PaintingStyle.stroke,
-      );
-      final tp = TextPainter(
-        text: TextSpan(
-          text: '$etiket ${capCm.floor()}',
-          style: TextStyle(
-            color: Colors.white,
-            fontSize: 9,
-            fontWeight: FontWeight.bold,
-            backgroundColor: renk,
-          ),
-        ),
-        textDirection: TextDirection.ltr,
-      )..layout();
-      tp.paint(canvas, c - Offset(tp.width / 2, tp.height / 2));
-    } else if (p1 != null) {
-      canvas.drawCircle(
-        Offset(p1.dx * size.width, p1.dy * size.height),
-        5,
-        Paint()..color = renk,
-      );
-    }
-  }
 
   @override
   void paint(Canvas canvas, Size size) {
@@ -1625,31 +1671,38 @@ class _OlcumOverlayPainter extends CustomPainter {
       );
     }
 
-    _cizReferans(canvas, size, ref1P1, ref1Center, ref1CapNorm, ref1CapCm, Colors.redAccent, 'R1', ref1Secili);
-    _cizReferans(canvas, size, ref2P1, ref2Center, ref2CapNorm, ref2CapCm, Colors.orange, 'R2', ref2Secili);
-
     for (int i = 0; i < tomruklar.length; i++) {
       final t = tomruklar[i];
       final isSelected = i == seciliIdx;
+      final Color renk = isSelected
+          ? Colors.cyanAccent
+          : (t.isReferans ? Colors.redAccent : Colors.lightGreenAccent);
+
       final center = Offset(t.xNorm * size.width, t.yNorm * size.height);
       final radius = max(3.0, (t.capNorm * size.width) / 2.0);
       canvas.drawCircle(
         center,
         radius,
         Paint()
-          ..color = isSelected ? Colors.cyanAccent : Colors.lightGreenAccent
-          ..strokeWidth = isSelected ? 3.0 : 1.8
+          ..color = renk
+          ..strokeWidth = (isSelected || t.isReferans) ? 3.0 : 1.8
           ..style = PaintingStyle.stroke,
       );
 
+      final String etiket = t.isReferans
+          ? 'R ${t.referansCapCm!.floor()}'
+          : (t.capCm != null ? '${t.capCm!.floor()}' : '?');
+
       final tp = TextPainter(
         text: TextSpan(
-          text: '${t.capCm.floor()}',
+          text: etiket,
           style: TextStyle(
             color: isSelected ? Colors.black : Colors.white,
             fontSize: 9,
             fontWeight: FontWeight.bold,
-            backgroundColor: isSelected ? Colors.cyanAccent : Colors.black54,
+            backgroundColor: isSelected
+                ? Colors.cyanAccent
+                : (t.isReferans ? Colors.redAccent : Colors.black54),
           ),
         ),
         textDirection: TextDirection.ltr,
