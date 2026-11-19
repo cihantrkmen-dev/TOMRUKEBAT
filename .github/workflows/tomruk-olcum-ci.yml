@@ -1,4 +1,4 @@
-name: TomrukOlcumAI CI/CD & Kameralı APK
+name: TomrukOlcumAI CI/CD & Lisanslı APK
 
 on:
   push:
@@ -13,7 +13,7 @@ permissions:
 
 jobs:
   build-camera-apk:
-    name: Kameralı Flutter Uygulamasını Güncelle ve APK Derle
+    name: Lisanslı Kameralı Flutter Uygulamasını Derle
     runs-on: ubuntu-latest
     steps:
       - name: Depoyu Klonla (Checkout)
@@ -31,26 +31,101 @@ jobs:
           channel: "stable"
           cache: true
 
-      - name: Flutter Projesini Hazırla ve Kamera Paketlerini Ekle
+      - name: Flutter Projesini Hazırla ve Paketleri Ekle
         run: |
           if [ ! -f mobile_app/pubspec.yaml ]; then
             flutter create --org com.tomruk --project-name tomruk_olcum_ai mobile_app
           fi
           cd mobile_app
-          flutter pub add image_picker image
+          flutter pub add image_picker image crypto shared_preferences
 
-      - name: Güncel Kameralı Ölçüm Kodunu Yaz
+      - name: Uygulama Kodunu Yaz (Lisanslama + Kabuksuz Ölçüm Motoru)
         run: |
           cat << 'EOF' > mobile_app/lib/main.dart
+          import 'dart:convert';
           import 'dart:io';
           import 'dart:math';
           import 'dart:typed_data';
+          import 'package:crypto/crypto.dart';
           import 'package:flutter/material.dart';
+          import 'package:flutter/services.dart';
           import 'package:image/image.dart' as img;
           import 'package:image_picker/image_picker.dart';
+          import 'package:shared_preferences/shared_preferences.dart';
 
           void main() {
             runApp(const TomrukOlcumApp());
+          }
+
+          // ====================================================================
+          // 1. ÇEVRİMDIŞI LİSANSLAMA VE GÜVENLİK SERVİSİ (XOR + SHA-256)
+          // ====================================================================
+          class LisansServisi {
+            static const String gelistiriciMail = 'cihantrkmen@gmail.com';
+            static const String _prefTalepKey = 'tomruk_talep_kodu_v1';
+            static const String _prefLisansKey = 'tomruk_lisans_anahtari_v1';
+
+            // Gizli Tuz (XOR 0x5A ile gizlenmiş bayt dizisi - düz metin içermez)
+            static const int _xorKey = 0x5A;
+            static const List<int> _gizliTuzBytes = [
+              21, 29, 23, 119, 30, 20, 0, 119, 104, 106, 104, 108, 119,
+              25, 19, 18, 27, 20, 119, 14, 15, 8, 17, 23, 31, 20, 119,
+              9, 27, 22, 14, 121, 99, 107
+            ];
+
+            // Yönetici şifresinin SHA-256 özeti
+            static const String _yoneticiSifreHash =
+                'fcf9ad9079a8319030d71827281b94f8513c610da250f0de32aa4302e8e3bb5f';
+
+            static String _tuzuCoz() {
+              return String.fromCharCodes(_gizliTuzBytes.map((b) => b ^ _xorKey));
+            }
+
+            static bool yoneticiSifresiDogrula(String girilenSifre) {
+              final digest = sha256.convert(utf8.encode(girilenSifre.trim())).toString();
+              return digest == _yoneticiSifreHash;
+            }
+
+            /// TALEP-XXXX kodundan OGM-XXXX-XXXX lisans anahtarı üretir
+            static String lisansAnahtariUret(String talepKodu) {
+              final temizTalep = talepKodu.trim().toUpperCase();
+              final girdi = '$temizTalep|${_tuzuCoz()}';
+              final hashHex = sha256.convert(utf8.encode(girdi)).toString().toUpperCase();
+              return 'OGM-${hashHex.substring(0, 4)}-${hashHex.substring(4, 8)}';
+            }
+
+            static Future<String> talepKoduGetirVeyaUret() async {
+              final prefs = await SharedPreferences.getInstance();
+              String? mevcut = prefs.getString(_prefTalepKey);
+              if (mevcut != null && mevcut.startsWith('TALEP-')) {
+                return mevcut;
+              }
+              const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+              final rnd = Random.secure();
+              final kod = List.generate(4, (_) => chars[rnd.nextInt(chars.length)]).join();
+              final yeniTalep = 'TALEP-$kod';
+              await prefs.setString(_prefTalepKey, yeniTalep);
+              return yeniTalep;
+            }
+
+            static Future<bool> lisansGecerliMi() async {
+              final prefs = await SharedPreferences.getInstance();
+              final talep = await talepKoduGetirVeyaUret();
+              final kayitliLisans = prefs.getString(_prefLisansKey);
+              if (kayitliLisans == null) return false;
+              return kayitliLisans.trim().toUpperCase() == lisansAnahtariUret(talep);
+            }
+
+            static Future<bool> lisansDogrulaVeKaydet(String girilenAnahtar) async {
+              final talep = await talepKoduGetirVeyaUret();
+              final beklenen = lisansAnahtariUret(talep);
+              if (girilenAnahtar.trim().toUpperCase() == beklenen) {
+                final prefs = await SharedPreferences.getInstance();
+                await prefs.setString(_prefLisansKey, beklenen);
+                return true;
+              }
+              return false;
+            }
           }
 
           class TomrukOlcumApp extends StatelessWidget {
@@ -65,11 +140,322 @@ jobs:
                   colorScheme: ColorScheme.fromSeed(seedColor: const Color(0xFF2E5A27)),
                   useMaterial3: true,
                 ),
-                home: const KameraOlcumSayfasi(),
+                home: const AcilisEkrani(),
               );
             }
           }
 
+          // ====================================================================
+          // 2. AÇILIŞ EKRANI (SPLASH SCREEN)
+          // ====================================================================
+          class AcilisEkrani extends StatefulWidget {
+            const AcilisEkrani({super.key});
+
+            @override
+            State<AcilisEkrani> createState() => _AcilisEkraniState();
+          }
+
+          class _AcilisEkraniState extends State<AcilisEkrani> {
+            @override
+            void initState() {
+              super.initState();
+              _yonlendir();
+            }
+
+            Future<void> _yonlendir() async {
+              await Future.delayed(const Duration(seconds: 2));
+              final lisansli = await LisansServisi.lisansGecerliMi();
+              if (!mounted) return;
+              Navigator.of(context).pushReplacement(
+                MaterialPageRoute(
+                  builder: (_) => lisansli ? const KameraOlcumSayfasi() : const LisansEkrani(),
+                ),
+              );
+            }
+
+            @override
+            Widget build(BuildContext context) {
+              return Scaffold(
+                backgroundColor: const Color(0xFF1F3D1B),
+                body: Center(
+                  child: Padding(
+                    padding: const EdgeInsets.all(24),
+                    child: Column(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      children: [
+                        const Icon(Icons.forest, size: 84, color: Colors.lightGreenAccent),
+                        const SizedBox(height: 16),
+                        const Text(
+                          'TomrukOlcumAI',
+                          style: TextStyle(
+                            color: Colors.white,
+                            fontSize: 28,
+                            fontWeight: FontWeight.bold,
+                            letterSpacing: 1.1,
+                          ),
+                        ),
+                        const SizedBox(height: 24),
+                        const Text(
+                          'Geliştirici CİHAN TÜRKMEN',
+                          textAlign: TextAlign.center,
+                          style: TextStyle(
+                            color: Colors.white,
+                            fontSize: 16,
+                            fontWeight: FontWeight.w600,
+                          ),
+                        ),
+                        const SizedBox(height: 4),
+                        const Text(
+                          'Denizli Orman Bölge Müdürlüğü',
+                          textAlign: TextAlign.center,
+                          style: TextStyle(
+                            color: Colors.white70,
+                            fontSize: 14,
+                          ),
+                        ),
+                        const SizedBox(height: 32),
+                        const CircularProgressIndicator(color: Colors.lightGreenAccent),
+                      ],
+                    ),
+                  ),
+                ),
+              );
+            }
+          }
+
+          // ====================================================================
+          // 3. ÇEVRİMDIŞI LİSANS VE GİZLİ YÖNETİCİ PANELİ
+          // ====================================================================
+          class LisansEkrani extends StatefulWidget {
+            const LisansEkrani({super.key});
+
+            @override
+            State<LisansEkrani> createState() => _LisansEkraniState();
+          }
+
+          class _LisansEkraniState extends State<LisansEkrani> {
+            String _talepKodu = '...';
+            final TextEditingController _lisansController = TextEditingController();
+            String? _hataMesaji;
+
+            @override
+            void initState() {
+              super.initState();
+              _talepYukle();
+            }
+
+            Future<void> _talepYukle() async {
+              final kod = await LisansServisi.talepKoduGetirVeyaUret();
+              if (mounted) setState(() => _talepKodu = kod);
+            }
+
+            @override
+            void dispose() {
+              _lisansController.dispose();
+              super.dispose();
+            }
+
+            Future<void> _lisansAktifle() async {
+              final ok = await LisansServisi.lisansDogrulaVeKaydet(_lisansController.text);
+              if (!mounted) return;
+              if (ok) {
+                Navigator.of(context).pushReplacement(
+                  MaterialPageRoute(builder: (_) => const KameraOlcumSayfasi()),
+                );
+              } else {
+                setState(() => _hataMesaji = 'Geçersiz lisans anahtarı. Lütfen kodu kontrol edin.');
+              }
+            }
+
+            void _yoneticiPaneliAc() {
+              final sifreCtrl = TextEditingController();
+              final talepCtrl = TextEditingController(text: _talepKodu);
+              String? uretilenAnahtar;
+              bool yetkili = false;
+              String? sifreHata;
+
+              showDialog(
+                context: context,
+                builder: (ctx) {
+                  return StatefulBuilder(
+                    builder: (ctx, setModalState) {
+                      return AlertDialog(
+                        title: const Text('Yönetici Lisans Paneli'),
+                        content: Column(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            if (!yetkili) ...[
+                              TextField(
+                                controller: sifreCtrl,
+                                obscureText: true,
+                                decoration: InputDecoration(
+                                  labelText: 'Yönetici Şifresi',
+                                  errorText: sifreHata,
+                                  border: const OutlineInputBorder(),
+                                ),
+                              ),
+                            ] else ...[
+                              TextField(
+                                controller: talepCtrl,
+                                decoration: const InputDecoration(
+                                  labelText: 'Kullanıcı Talep Kodu (TALEP-XXXX)',
+                                  border: OutlineInputBorder(),
+                                ),
+                              ),
+                              const SizedBox(height: 12),
+                              FilledButton(
+                                onPressed: () {
+                                  setModalState(() {
+                                    uretilenAnahtar = LisansServisi.lisansAnahtariUret(talepCtrl.text);
+                                  });
+                                },
+                                child: const Text('Lisans Anahtarı Üret'),
+                              ),
+                              if (uretilenAnahtar != null) ...[
+                                const SizedBox(height: 12),
+                                SelectableText(
+                                  uretilenAnahtar!,
+                                  style: const TextStyle(
+                                    fontSize: 18,
+                                    fontWeight: FontWeight.bold,
+                                    color: Colors.green,
+                                  ),
+                                ),
+                                TextButton.icon(
+                                  icon: const Icon(Icons.copy),
+                                  label: const Text('Kopyala'),
+                                  onPressed: () {
+                                    Clipboard.setData(ClipboardData(text: uretilenAnahtar!));
+                                    ScaffoldMessenger.of(context).showSnackBar(
+                                      const SnackBar(content: Text('Lisans anahtarı kopyalandı.')),
+                                    );
+                                  },
+                                ),
+                              ],
+                            ],
+                          ],
+                        ),
+                        actions: [
+                          TextButton(
+                            onPressed: () => Navigator.of(ctx).pop(),
+                            child: const Text('Kapat'),
+                          ),
+                          if (!yetkili)
+                            FilledButton(
+                              onPressed: () {
+                                if (LisansServisi.yoneticiSifresiDogrula(sifreCtrl.text)) {
+                                  setModalState(() {
+                                    yetkili = true;
+                                    sifreHata = null;
+                                  });
+                                } else {
+                                  setModalState(() => sifreHata = 'Hatalı yönetici şifresi');
+                                }
+                              },
+                              child: const Text('Giriş'),
+                            ),
+                        ],
+                      );
+                    },
+                  );
+                },
+              );
+            }
+
+            @override
+            Widget build(BuildContext context) {
+              return Scaffold(
+                appBar: AppBar(
+                  title: const Text('Lisans Aktivasyonu'),
+                  backgroundColor: Theme.of(context).colorScheme.primaryContainer,
+                  actions: [
+                    IconButton(
+                      tooltip: 'Yönetici Paneli',
+                      icon: const Icon(Icons.admin_panel_settings),
+                      onPressed: _yoneticiPaneliAc,
+                    ),
+                  ],
+                ),
+                body: ListView(
+                  padding: const EdgeInsets.all(20),
+                  children: [
+                    const Icon(Icons.verified_user_outlined, size: 64, color: Color(0xFF2E5A27)),
+                    const SizedBox(height: 12),
+                    const Text(
+                      'Geliştirici CİHAN TÜRKMEN\nDenizli Orman Bölge Müdürlüğü',
+                      textAlign: TextAlign.center,
+                      style: TextStyle(fontWeight: FontWeight.bold, fontSize: 15),
+                    ),
+                    const SizedBox(height: 16),
+                    Card(
+                      child: Padding(
+                        padding: const EdgeInsets.all(16),
+                        child: Column(
+                          children: [
+                            const Text('Cihaz Talep Kodunuz:', style: TextStyle(fontSize: 13)),
+                            const SizedBox(height: 6),
+                            SelectableText(
+                              _talepKodu,
+                              style: const TextStyle(
+                                fontSize: 24,
+                                fontWeight: FontWeight.bold,
+                                letterSpacing: 1.5,
+                              ),
+                            ),
+                            const SizedBox(height: 8),
+                            TextButton.icon(
+                              icon: const Icon(Icons.copy),
+                              label: const Text('Talep Kodunu Kopyala'),
+                              onPressed: () {
+                                Clipboard.setData(ClipboardData(text: _talepKodu));
+                                ScaffoldMessenger.of(context).showSnackBar(
+                                  const SnackBar(content: Text('Talep kodu kopyalandı.')),
+                                );
+                              },
+                            ),
+                            const Divider(height: 20),
+                            const Text(
+                              'Lisans anahtarı almak için yukarıdaki talep kodunu aşağıdaki e-posta adresine iletin:',
+                              textAlign: TextAlign.center,
+                              style: TextStyle(fontSize: 12),
+                            ),
+                            const SizedBox(height: 6),
+                            const SelectableText(
+                              LisansServisi.gelistiriciMail,
+                              style: TextStyle(
+                                fontWeight: FontWeight.bold,
+                                color: Color(0xFF2E5A27),
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                    const SizedBox(height: 16),
+                    TextField(
+                      controller: _lisansController,
+                      textCapitalization: TextCapitalization.characters,
+                      decoration: InputDecoration(
+                        labelText: 'Lisans Anahtarı (OGM-XXXX-XXXX)',
+                        errorText: _hataMesaji,
+                        border: const OutlineInputBorder(),
+                      ),
+                    ),
+                    const SizedBox(height: 12),
+                    FilledButton.icon(
+                      onPressed: _lisansAktifle,
+                      icon: const Icon(Icons.lock_open),
+                      label: const Text('Lisansı Doğrula ve Başlat'),
+                    ),
+                  ],
+                ),
+              );
+            }
+          }
+
+          // ====================================================================
+          // 4. KABUKSUZ KAMERALI TOMRUK ÖLÇÜM MOTORU
+          // ====================================================================
           class TespitEdilenTomruk {
             double xNorm;
             double yNorm;
@@ -110,11 +496,10 @@ jobs:
             int _fotoYukseklik = 1;
             bool _isleniyor = false;
 
-            // Referans kalibrasyon
             Offset? _refP1;
             Offset? _refP2;
-            Offset? _refCenterNorm; // Kırmızı referans tomruk çemberi merkezi
-            double? _refCapNorm;    // Kırmızı referans tomruk çemberi çapı (genişlik normalize)
+            Offset? _refCenterNorm;
+            double? _refCapNorm;
             bool _referansSecili = false;
 
             ReferansTipi _referansTipi = ReferansTipi.bilinenTomrukCapi;
@@ -122,24 +507,13 @@ jobs:
             final TextEditingController _bilinenCapController = TextEditingController(text: '28');
             double? _cmPerNormGenislik;
 
-            // Tespit edilen tomruklar
             final List<TespitEdilenTomruk> _tomruklar = [];
             int? _seciliTomrukIdx;
             EtkilesimModu _mod = EtkilesimModu.kalibrasyon;
 
-            final Map<String, double> _kabukOranlari = const {
-              'Kızılçam': 12.0,
-              'Karaçam': 11.0,
-              'Sedir': 10.0,
-              'Kayın': 5.0,
-              'Meşe': 9.0,
-              'Diğer (0%)': 0.0,
-            };
-            String _seciliTur = 'Kızılçam';
             double _tomrukBoyu = 3.0;
-            double _varsayilanManuelCapCm = 24.0;
+            final double _varsayilanManuelCapCm = 24.0;
 
-            double get _kabukOrani => _kabukOranlari[_seciliTur] ?? 0.0;
             double get _invAspect => _fotoYukseklik / max(1, _fotoGenislik);
 
             @override
@@ -471,15 +845,12 @@ jobs:
               final yeniX = (t.xNorm + dxNorm).clamp(0.01, 0.99);
               final yeniY = (t.yNorm + dyNorm).clamp(0.01, 0.99);
 
-              // Yeni merkezde çakışma kontrolü
               final maxRNorm = _maksimumCakismasizYaricapNorm(
                 yeniX,
                 yeniY,
                 haricIdx: _seciliTomrukIdx,
               );
-              if (t.capNorm / 2.0 > maxRNorm) {
-                return;
-              }
+              if (t.capNorm / 2.0 > maxRNorm) return;
 
               setState(() {
                 t.xNorm = yeniX;
@@ -536,7 +907,6 @@ jobs:
                 int? enYakinIdx;
                 bool refEnYakin = false;
 
-                // Önce kırmızı referans tomruk çemberini kontrol et
                 if (_referansTipi == ReferansTipi.bilinenTomrukCapi && _refCenterNorm != null) {
                   final dx = _refCenterNorm!.dx - nx;
                   final dy = (_refCenterNorm!.dy - ny) * _invAspect;
@@ -606,12 +976,11 @@ jobs:
               }
             }
 
-            /// Ondalık çaplar tam sayıya AŞAĞI yuvarlanarak (floor) hacim hesaplanır
-            double _hacimHesapla(double capCm, {required bool kabuksuz}) {
+            /// Kabuksuz net hacim: Ondalık çaplar tam sayıya AŞAĞI yuvarlanarak (floor) hesaplanır
+            double _netHacimHesapla(double capCm) {
               final int tamCapCm = capCm.floor();
               final rMetre = (tamCapCm / 100.0) / 2.0;
-              final brut = pi * rMetre * rMetre * _tomrukBoyu;
-              return kabuksuz ? brut * (1.0 - _kabukOrani / 100.0) : brut;
+              return pi * rMetre * rMetre * _tomrukBoyu;
             }
 
             Widget _yonTuslari({required void Function(double dx, double dy) onKaydir}) {
@@ -646,8 +1015,7 @@ jobs:
 
             @override
             Widget build(BuildContext context) {
-              final brutToplam = _tomruklar.fold(0.0, (s, t) => s + _hacimHesapla(t.capCm, kabuksuz: false));
-              final netToplam = _tomruklar.fold(0.0, (s, t) => s + _hacimHesapla(t.capCm, kabuksuz: true));
+              final toplamHacim = _tomruklar.fold(0.0, (s, t) => s + _netHacimHesapla(t.capCm));
               final ince = _tomruklar.where((t) => t.capCm.floor() < 20).length;
               final orta = _tomruklar.where((t) => t.capCm.floor() >= 20 && t.capCm.floor() < 30).length;
               final kalin = _tomruklar.where((t) => t.capCm.floor() >= 30).length;
@@ -656,7 +1024,7 @@ jobs:
 
               return Scaffold(
                 appBar: AppBar(
-                  title: const Text('TomrukOlcumAI - Kamera'),
+                  title: const Text('TomrukOlcumAI'),
                   backgroundColor: Theme.of(context).colorScheme.primaryContainer,
                   actions: [
                     if (_seciliFoto != null)
@@ -750,7 +1118,6 @@ jobs:
                         selected: {_mod},
                         onSelectionChanged: (s) => setState(() => _mod = s.first),
                       ),
-                      // Kırmızı Referans Tomruk Düzenleme Paneli
                       if (_referansSecili && _refCenterNorm != null && _refCapNorm != null) ...[
                         const SizedBox(height: 8),
                         Card(
@@ -790,7 +1157,6 @@ jobs:
                           ),
                         ),
                       ],
-                      // Seçili Tomruk Düzenleme Paneli (Merkez + Çap)
                       if (seciliTomruk != null) ...[
                         const SizedBox(height: 8),
                         Card(
@@ -915,52 +1281,28 @@ jobs:
                         child: Column(
                           crossAxisAlignment: CrossAxisAlignment.start,
                           children: [
-                            Row(
-                              children: [
-                                Expanded(
-                                  child: DropdownButtonFormField<String>(
-                                    value: _seciliTur,
-                                    decoration: const InputDecoration(
-                                      labelText: 'Ağaç Türü',
-                                      border: OutlineInputBorder(),
-                                      isDense: true,
-                                    ),
-                                    items: _kabukOranlari.entries
-                                        .map((e) => DropdownMenuItem(value: e.key, child: Text('${e.key} (%${e.value.toInt()})')))
-                                        .toList(),
-                                    onChanged: (v) {
-                                      if (v != null) setState(() => _seciliTur = v);
-                                    },
-                                  ),
-                                ),
-                                const SizedBox(width: 8),
-                                Expanded(
-                                  child: DropdownButtonFormField<double>(
-                                    value: _tomrukBoyu,
-                                    decoration: const InputDecoration(
-                                      labelText: 'Boy (m)',
-                                      border: OutlineInputBorder(),
-                                      isDense: true,
-                                    ),
-                                    items: const [2.0, 2.5, 3.0, 4.0, 5.0]
-                                        .map((b) => DropdownMenuItem(value: b, child: Text('$b m')))
-                                        .toList(),
-                                    onChanged: (v) {
-                                      if (v != null) setState(() => _tomrukBoyu = v);
-                                    },
-                                  ),
-                                ),
-                              ],
+                            DropdownButtonFormField<double>(
+                              value: _tomrukBoyu,
+                              decoration: const InputDecoration(
+                                labelText: 'Tomruk Boyu (m)',
+                                border: OutlineInputBorder(),
+                                isDense: true,
+                              ),
+                              items: const [2.0, 2.5, 3.0, 4.0, 5.0]
+                                  .map((b) => DropdownMenuItem(value: b, child: Text('$b m')))
+                                  .toList(),
+                              onChanged: (v) {
+                                if (v != null) setState(() => _tomrukBoyu = v);
+                              },
                             ),
                             const Divider(height: 20),
                             Text(
                               'Toplam Adet: ${_tomruklar.length}',
                               style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
                             ),
-                            Text('Kabuklu Hacim (aşağı yuvarlı çap): ${brutToplam.toStringAsFixed(3)} m³'),
                             Text(
-                              'Kabuksuz Net Hacim: ${netToplam.toStringAsFixed(3)} m³',
-                              style: const TextStyle(fontWeight: FontWeight.bold),
+                              'Toplam Net Hacim (Kabuksuz): ${toplamHacim.toStringAsFixed(3)} m³',
+                              style: const TextStyle(fontSize: 15, fontWeight: FontWeight.bold),
                             ),
                             const SizedBox(height: 4),
                             Text('İnce (<20 cm): $ince | Orta (20-29 cm): $orta | Kalın (30+ cm): $kalin'),
@@ -997,7 +1339,6 @@ jobs:
 
             @override
             void paint(Canvas canvas, Size size) {
-              // Bilinen tomruk çapı seçiliyse KIRMIZI ÇEMBER çiz
               if (refCenterNorm != null && refCapNorm != null) {
                 final center = Offset(refCenterNorm!.dx * size.width, refCenterNorm!.dy * size.height);
                 final radius = max(4.0, (refCapNorm! * size.width) / 2.0);
@@ -1021,7 +1362,6 @@ jobs:
                 )..layout();
                 tp.paint(canvas, center - Offset(tp.width / 2, tp.height / 2));
               } else if (refP1 != null) {
-                // Levha veya çubuk için sarı referans çizgisi (veya ilk nokta)
                 final refPaint = Paint()
                   ..color = Colors.amber
                   ..strokeWidth = 2.5
@@ -1035,7 +1375,6 @@ jobs:
                 }
               }
 
-              // Tespit edilen tomruk çemberleri (tam sayıya aşağı yuvarlı etiket)
               for (int i = 0; i < tomruklar.length; i++) {
                 final t = tomruklar[i];
                 final isSelected = i == seciliIdx;
@@ -1071,12 +1410,21 @@ jobs:
 
           cat << 'EOF' > mobile_app/test/widget_test.dart
           import 'package:flutter_test/flutter_test.dart';
+          import 'package:shared_preferences/shared_preferences.dart';
           import 'package:tomruk_olcum_ai/main.dart';
 
           void main() {
-            testWidgets('KameraOlcumSayfasi acilis testi', (WidgetTester tester) async {
+            testWidgets('AcilisEkrani ve LisansServisi testi', (WidgetTester tester) async {
+              SharedPreferences.setMockInitialValues({});
+              expect(LisansServisi.yoneticiSifresiDogrula('Cihan2026!'), isTrue);
+              expect(LisansServisi.yoneticiSifresiDogrula('yanlis'), isFalse);
+
+              final anahtar = LisansServisi.lisansAnahtariUret('TALEP-TEST');
+              expect(anahtar.startsWith('OGM-'), isTrue);
+
               await tester.pumpWidget(const TomrukOlcumApp());
-              expect(find.text('TomrukOlcumAI - Kamera'), findsOneWidget);
+              expect(find.text('Geliştirici CİHAN TÜRKMEN'), findsOneWidget);
+              await tester.pumpAndSettle(const Duration(seconds: 3));
             });
           }
           EOF
@@ -1086,10 +1434,10 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add mobile_app
-          git diff --staged --quiet || git commit -m "feat: merkez kaydirma, asagi yuvarlama ve kirmizi referans cemberi eklendi"
+          git diff --staged --quiet || git commit -m "feat: cevrimdisi lisanslama, yonetici paneli, R8 koruma ve kabuksuz olcum eklendi"
           git push
 
-      - name: Test Et ve APK Üret
+      - name: R8/ProGuard Aktifle, Test Et ve APK Üret
         working-directory: mobile_app
         run: |
           if [ -f android/build.gradle.kts ]; then
@@ -1097,9 +1445,16 @@ jobs:
           elif [ -f android/build.gradle ]; then
             grep -q "lintVital" android/build.gradle || printf '\nsubprojects {\n    tasks.configureEach {\n        if (name.contains("lintVital")) {\n            enabled = false\n        }\n    }\n}\n' >> android/build.gradle
           fi
+
+          if [ -f android/app/build.gradle.kts ]; then
+            sed -i 's/isMinifyEnabled = false/isMinifyEnabled = true/g' android/app/build.gradle.kts
+          elif [ -f android/app/build.gradle ]; then
+            sed -i 's/minifyEnabled false/minifyEnabled true/g' android/app/build.gradle
+          fi
+
           flutter pub get
           flutter test
-          flutter build apk --release
+          flutter build apk --release --obfuscate --split-debug-info=build/debug-info
 
       - name: APK Çıktısını Yükle (Artifact)
         uses: actions/upload-artifact@v4
