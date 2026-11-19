@@ -43,7 +43,7 @@ class TespitEdilenTomruk {
 class _AdayDaire {
   final double x;
   final double y;
-  final double r;
+  double r;
   final double skor;
   _AdayDaire(this.x, this.y, this.r, this.skor);
 }
@@ -90,6 +90,7 @@ class _KameraOlcumSayfasiState extends State<KameraOlcumSayfasi> {
   double _varsayilanManuelCapCm = 24.0;
 
   double get _kabukOrani => _kabukOranlari[_seciliTur] ?? 0.0;
+  double get _invAspect => _fotoYukseklik / max(1, _fotoGenislik);
 
   @override
   void dispose() {
@@ -100,6 +101,25 @@ class _KameraOlcumSayfasiState extends State<KameraOlcumSayfasi> {
 
   void _zoomSifirla() {
     _zoomController.value = Matrix4.identity();
+  }
+
+  /// Belirli bir merkez (nx, ny) için komşu çemberlerle HİÇ çakışmadan
+  /// alabileceği maksimum yarıçapı (genişlik normalize biriminde) hesaplar.
+  double _maksimumCakismasizYaricapNorm(double nx, double ny, {int? haricIdx}) {
+    double maxR = 0.5;
+    for (int i = 0; i < _tomruklar.length; i++) {
+      if (i == haricIdx) continue;
+      final other = _tomruklar[i];
+      final dx = nx - other.xNorm;
+      final dy = (ny - other.yNorm) * _invAspect;
+      final merkezMesafe = sqrt(dx * dx + dy * dy);
+      final otherR = other.capNorm / 2.0;
+      final kalanBosluk = merkezMesafe - otherR;
+      if (kalanBosluk < maxR) {
+        maxR = kalanBosluk;
+      }
+    }
+    return maxR;
   }
 
   void _referansTipiniGuncelle(ReferansTipi yeniTip) {
@@ -166,7 +186,7 @@ class _KameraOlcumSayfasiState extends State<KameraOlcumSayfasi> {
     });
   }
 
-  /// Mesafe Dönüşümü (Distance Transform) + Çakışma Önleme (NMS) ile dairesel tomruk tespiti
+  /// Mesafe Dönüşümü + Kesin Sıfır Çakışma (Teğet Sınırı: d >= r1 + r2)
   Future<void> _otomatikTespitCalistir() async {
     if (_seciliFoto == null) return;
     if (_cmPerNormGenislik == null) {
@@ -196,7 +216,7 @@ class _KameraOlcumSayfasiState extends State<KameraOlcumSayfasi> {
       final int h = max(1, (orijinal.height * w / orijinal.width).round());
       final img.Image kucuk = img.copyResize(orijinal, width: w, height: h);
 
-      // 1) Ahşap kesiti maskesi (gökyüzü, yeşil çim ve koyu gölgeleri ele)
+      // 1) Ahşap kesiti maskesi
       final List<int> mask = List<int>.filled(w * h, 0);
       for (int y = 0; y < h; y++) {
         for (int x = 0; x < w; x++) {
@@ -214,7 +234,7 @@ class _KameraOlcumSayfasiState extends State<KameraOlcumSayfasi> {
         }
       }
 
-      // 2) 2-geçişli Chamfer Mesafe Dönüşümü (temas eden dairelerin merkez zirvelerini bulur)
+      // 2) Chamfer Mesafe Dönüşümü
       final Float64List dist = Float64List(w * h);
       const double inf = 1e6;
       for (int i = 0; i < w * h; i++) {
@@ -247,7 +267,7 @@ class _KameraOlcumSayfasiState extends State<KameraOlcumSayfasi> {
         }
       }
 
-      // 3) Yerel maksimumları (daire merkez adaylarını) topla
+      // 3) Daire merkez adaylarını topla
       final double minR = max(3.5, (6.0 / _cmPerNormGenislik!) * w / 2.0);
       final double maxR = min(w * 0.18, (120.0 / _cmPerNormGenislik!) * w / 2.0);
       final List<_AdayDaire> adaylar = [];
@@ -269,7 +289,6 @@ class _KameraOlcumSayfasiState extends State<KameraOlcumSayfasi> {
           }
           if (!isPeak) continue;
 
-          // Daire içi doluluk (dairesellik) kontrolü
           final int ri = val.round();
           int toplam = 0;
           int dolu = 0;
@@ -287,27 +306,36 @@ class _KameraOlcumSayfasiState extends State<KameraOlcumSayfasi> {
           }
           final doluluk = toplam > 0 ? dolu / toplam : 0.0;
           if (doluluk >= 0.68) {
-            adaylar.add(_AdayDaire(x.toDouble(), y.toDouble(), val * 1.06, val * doluluk));
+            adaylar.add(_AdayDaire(x.toDouble(), y.toDouble(), val * 1.04, val * doluluk));
           }
         }
       }
 
-      // 4) Sıkı Çakışma Önleme (NMS): Üst üste binen daireleri engelle, sadece temas edenlere izin ver
+      // 4) KESİN SIFIR ÇAKIŞMA KURALI:
+      // Çemberler 3-4 komşuya teğet temas edebilir ama alanları ASLA iç içe geçemez (d >= r1 + r2).
       adaylar.sort((a, b) => b.skor.compareTo(a.skor));
       final List<_AdayDaire> secilenler = [];
       for (final aday in adaylar) {
-        bool cakisiyor = false;
+        double izinVerilenMaxR = aday.r;
+        bool gecersiz = false;
+
         for (final s in secilenler) {
           final dx = aday.x - s.x;
           final dy = aday.y - s.y;
           final merkezMesafe = sqrt(dx * dx + dy * dy);
-          // İki tomruk temas edebilir ama iç içe geçemez (%85 yarıçap toplamı kuralı)
-          if (merkezMesafe < (aday.r + s.r) * 0.85) {
-            cakisiyor = true;
+          final kalanBosluk = merkezMesafe - s.r;
+
+          if (kalanBosluk < minR) {
+            gecersiz = true;
             break;
           }
+          if (kalanBosluk < izinVerilenMaxR) {
+            izinVerilenMaxR = kalanBosluk;
+          }
         }
-        if (!cakisiyor) {
+
+        if (!gecersiz && izinVerilenMaxR >= minR) {
+          aday.r = izinVerilenMaxR;
           secilenler.add(aday);
         }
       }
@@ -339,7 +367,7 @@ class _KameraOlcumSayfasiState extends State<KameraOlcumSayfasi> {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
             content: Text(
-              '${bulunanlar.length} adet tomruk tespit edildi. Bir daireye dokunarak çapını ayarlayabilir veya silebilirsiniz.',
+              '${bulunanlar.length} adet çakışmasız tomruk tespit edildi. Daireye dokunup çapını ayarlayabilirsiniz.',
             ),
           ),
         );
@@ -351,14 +379,26 @@ class _KameraOlcumSayfasiState extends State<KameraOlcumSayfasi> {
 
   void _seciliTomrukCapGuncelle(double yeniCapCm) {
     if (_seciliTomrukIdx == null || _seciliTomrukIdx! >= _tomruklar.length) return;
-    final clamped = yeniCapCm.clamp(6.0, 150.0);
-    setState(() {
-      final t = _tomruklar[_seciliTomrukIdx!];
-      t.capCm = clamped;
-      if (_cmPerNormGenislik != null && _cmPerNormGenislik! > 0) {
-        t.capNorm = clamped / _cmPerNormGenislik!;
+    final t = _tomruklar[_seciliTomrukIdx!];
+    double hedefCapCm = yeniCapCm.clamp(6.0, 150.0);
+
+    if (_cmPerNormGenislik != null && _cmPerNormGenislik! > 0) {
+      final maxRNorm = _maksimumCakismasizYaricapNorm(
+        t.xNorm,
+        t.yNorm,
+        haricIdx: _seciliTomrukIdx,
+      );
+      final maxCapCm = max(6.0, (maxRNorm * 2.0) * _cmPerNormGenislik!);
+      if (hedefCapCm > maxCapCm) {
+        hedefCapCm = maxCapCm;
       }
-    });
+      setState(() {
+        t.capCm = hedefCapCm;
+        t.capNorm = hedefCapCm / _cmPerNormGenislik!;
+      });
+    } else {
+      setState(() => t.capCm = hedefCapCm);
+    }
   }
 
   void _fotoyaDokunuldu(TapDownDetails details, Size widgetSize) {
@@ -383,7 +423,7 @@ class _KameraOlcumSayfasiState extends State<KameraOlcumSayfasi> {
       double minMesafe = 0.08;
       for (int i = 0; i < _tomruklar.length; i++) {
         final dx = _tomruklar[i].xNorm - nx;
-        final dy = _tomruklar[i].yNorm - ny;
+        final dy = (_tomruklar[i].yNorm - ny) * _invAspect;
         final d = sqrt(dx * dx + dy * dy);
         if (d < minMesafe) {
           minMesafe = d;
@@ -392,15 +432,36 @@ class _KameraOlcumSayfasiState extends State<KameraOlcumSayfasi> {
       }
       setState(() => _seciliTomrukIdx = enYakinIdx);
     } else if (_mod == EtkilesimModu.tomrukEkle) {
-      final capCm = _varsayilanManuelCapCm;
-      final capNorm = _cmPerNormGenislik != null ? capCm / _cmPerNormGenislik! : 0.06;
+      final maxRNorm = _maksimumCakismasizYaricapNorm(nx, ny);
+      final minRNorm = (_cmPerNormGenislik != null && _cmPerNormGenislik! > 0)
+          ? (6.0 / _cmPerNormGenislik!) / 2.0
+          : 0.015;
+
+      if (maxRNorm < minRNorm) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Bu alan mevcut bir tomrukla çakışıyor; boş bir merkeze dokunun.'),
+            duration: Duration(seconds: 2),
+          ),
+        );
+        return;
+      }
+
+      final istenenCapNorm = _cmPerNormGenislik != null
+          ? _varsayilanManuelCapCm / _cmPerNormGenislik!
+          : 0.06;
+      final gercekCapNorm = min(istenenCapNorm, maxRNorm * 2.0);
+      final gercekCapCm = _cmPerNormGenislik != null
+          ? gercekCapNorm * _cmPerNormGenislik!
+          : _varsayilanManuelCapCm;
+
       setState(() {
         _tomruklar.add(
           TespitEdilenTomruk(
             xNorm: nx,
             yNorm: ny,
-            capNorm: capNorm,
-            capCm: capCm,
+            capNorm: gercekCapNorm,
+            capCm: gercekCapCm,
           ),
         );
         _seciliTomrukIdx = _tomruklar.length - 1;
@@ -463,15 +524,13 @@ class _KameraOlcumSayfasiState extends State<KameraOlcumSayfasi> {
           if (_seciliFoto != null) ...[
             Card(
               clipBehavior: Clip.antiAlias,
-              child: LayoutBuilder(
-                builder: (context, constraints) {
-                  final aspect = _fotoGenislik / _fotoYukseklik;
-                  final w = constraints.maxWidth;
-                  final h = (w / aspect).clamp(220.0, 420.0);
-                  return SizedBox(
-                    width: w,
-                    height: h,
-                    child: InteractiveViewer(
+              child: AspectRatio(
+                aspectRatio: _fotoGenislik / max(1, _fotoYukseklik),
+                child: LayoutBuilder(
+                  builder: (context, constraints) {
+                    final w = constraints.maxWidth;
+                    final h = constraints.maxHeight;
+                    return InteractiveViewer(
                       transformationController: _zoomController,
                       minScale: 1.0,
                       maxScale: 6.0,
@@ -496,9 +555,9 @@ class _KameraOlcumSayfasiState extends State<KameraOlcumSayfasi> {
                           ),
                         ),
                       ),
-                    ),
-                  );
-                },
+                    );
+                  },
+                ),
               ),
             ),
             const Padding(
@@ -739,7 +798,7 @@ class _OlcumOverlayPainter extends CustomPainter {
         ..style = PaintingStyle.stroke;
 
       final center = Offset(t.xNorm * size.width, t.yNorm * size.height);
-      final radius = max(6.0, (t.capNorm * size.width) / 2.0);
+      final radius = max(3.0, (t.capNorm * size.width) / 2.0);
       canvas.drawCircle(center, radius, logPaint);
 
       final tp = TextPainter(
