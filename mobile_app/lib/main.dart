@@ -467,7 +467,8 @@ class _KameraOlcumSayfasiState extends State<KameraOlcumSayfasi> {
   int? _seciliTomrukIdx;
   EtkilesimModu _mod = EtkilesimModu.kalibrasyon;
 
-  double _tomrukBoyu = 3.0;
+  double _emvalBoyu = 3.0;
+  final TextEditingController _emvalBoyuController = TextEditingController(text: '3.0');
   final double _varsayilanManuelCapCm = 24.0;
 
   double get _invAspect => _fotoYukseklik / max(1, _fotoGenislik);
@@ -475,12 +476,20 @@ class _KameraOlcumSayfasiState extends State<KameraOlcumSayfasi> {
   @override
   void dispose() {
     _bilinenCapController.dispose();
+    _emvalBoyuController.dispose();
     _zoomController.dispose();
     super.dispose();
   }
 
   void _zoomSifirla() {
     _zoomController.value = Matrix4.identity();
+  }
+
+  void _emvalBoyuDegisti(String val) {
+    final girilen = double.tryParse(val.replaceAll(',', '.'));
+    if (girilen != null && girilen > 0 && girilen <= 30.0) {
+      setState(() => _emvalBoyu = girilen);
+    }
   }
 
   double _maksimumCakismasizYaricapNorm(double nx, double ny, {int? haricIdx}) {
@@ -936,7 +945,7 @@ class _KameraOlcumSayfasiState extends State<KameraOlcumSayfasi> {
   double _netHacimHesapla(double capCm) {
     final int tamCapCm = capCm.floor();
     final rMetre = (tamCapCm / 100.0) / 2.0;
-    return pi * rMetre * rMetre * _tomrukBoyu;
+    return pi * rMetre * rMetre * _emvalBoyu;
   }
 
   Widget _yonTuslari({required void Function(double dx, double dy) onKaydir}) {
@@ -1237,19 +1246,16 @@ class _KameraOlcumSayfasiState extends State<KameraOlcumSayfasi> {
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  DropdownButtonFormField<double>(
-                    value: _tomrukBoyu,
+                  TextField(
+                    controller: _emvalBoyuController,
+                    keyboardType: const TextInputType.numberWithOptions(decimal: true),
                     decoration: const InputDecoration(
-                      labelText: 'Tomruk Boyu (m)',
+                      labelText: 'Emval Boyu (m)',
+                      helperText: 'Klavyeden istediğiniz boyu metre cinsinden girin (örn: 2.5, 3.0, 4.2)',
                       border: OutlineInputBorder(),
                       isDense: true,
                     ),
-                    items: const [2.0, 2.5, 3.0, 4.0, 5.0]
-                        .map((b) => DropdownMenuItem(value: b, child: Text('$b m')))
-                        .toList(),
-                    onChanged: (v) {
-                      if (v != null) setState(() => _tomrukBoyu = v);
-                    },
+                    onChanged: _emvalBoyuDegisti,
                   ),
                   const Divider(height: 20),
                   Text(
