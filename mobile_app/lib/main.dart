@@ -270,7 +270,7 @@ class YoloTfliteServisi {
 
       final double rNorm = (bw + bh) / 4.0;
       if (rNorm > 0.005 && rNorm < 0.35) {
-        adaylar.add(_AdayDaire(cx.clamp(0.0, 1.0), cy.clamp(0.0, 1.0), rNorm, maxConf));
+        adaylar.add(_AdayDaire(cx.clamp(0.0, 1.0).toDouble(), cy.clamp(0.0, 1.0).toDouble(), rNorm, maxConf));
       }
     }
     return adaylar;
@@ -279,10 +279,8 @@ class YoloTfliteServisi {
   /// Uzun istifler için %20 örtüşmeli otomatik yatay dilimleme + tam kare birleştirme
   List<_AdayDaire> dilimliTespitEt(img.Image orijinal, {double confEsik = 0.25}) {
     final List<_AdayDaire> tumu = [];
-    // 1) Tam kare taraması (büyük tomrukları yakalar)
     tumu.addAll(_tekKareTespit(orijinal, confEsik: confEsik));
 
-    // 2) Geniş/yüksek çözünürlüklü karelerde %20 örtüşmeli 2 veya 3 dilim
     if (orijinal.width >= 900) {
       final int dilimSayisi = (orijinal.width / max(1, orijinal.height)) > 1.45 ? 3 : 2;
       final double ortusme = 0.20;
@@ -306,7 +304,7 @@ class YoloTfliteServisi {
           final gx = (startX + a.x * dilimW) / orijinal.width;
           final gy = a.y;
           final gr = (a.r * dilimW) / orijinal.width;
-          tumu.add(_AdayDaire(gx.clamp(0.0, 1.0), gy.clamp(0.0, 1.0), gr, a.skor));
+          tumu.add(_AdayDaire(gx.clamp(0.0, 1.0).toDouble(), gy.clamp(0.0, 1.0).toDouble(), gr, a.skor));
         }
       }
     }
@@ -335,7 +333,6 @@ class PdfRaporServisi {
       boldFont = pw.Font.helveticaBold();
     }
 
-    // Çaplara göre grupla ve küçükten büyüğe sırala
     final Map<int, int> capAdetMap = {};
     for (final c in tamCaplarCm) {
       capAdetMap[c] = (capAdetMap[c] ?? 0) + 1;
@@ -758,7 +755,6 @@ class _KameraOlcumSayfasiState extends State<KameraOlcumSayfasi> {
   double _emvalBoyu = 3.0;
   final TextEditingController _emvalBoyuController = TextEditingController(text: '3.0');
 
-  // Parçalı istif oturumu (çoklu kare birleştirme)
   final List<IstifParcasi> _istifParcalari = [];
 
   double get _invAspect => _fotoYukseklik / max(1, _fotoGenislik);
@@ -841,7 +837,6 @@ class _KameraOlcumSayfasiState extends State<KameraOlcumSayfasi> {
   }
 
   Future<void> _fotoAl(ImageSource kaynak) async {
-    // Yüksek çözünürlüğü korumak için maxWidth kısıtı kaldırıldı
     final XFile? dosya = await _picker.pickImage(
       source: kaynak,
       imageQuality: 92,
@@ -898,7 +893,6 @@ class _KameraOlcumSayfasiState extends State<KameraOlcumSayfasi> {
     return closed;
   }
 
-  /// Yedek motor: %20 örtüşmeli otomatik yatay dilimleme + morfolojik kapama
   List<_AdayDaire> _yedekMotorDilimliTespit(img.Image orijinal) {
     final List<_AdayDaire> tumAdaylar = [];
     final int dilimSayisi = (orijinal.width / max(1, orijinal.height)) > 1.35 ? 2 : 1;
@@ -1000,7 +994,7 @@ class _KameraOlcumSayfasiState extends State<KameraOlcumSayfasi> {
             final gx = (startX + (x / w) * dilimW) / orijinal.width;
             final gy = y / h;
             final gr = ((val * 1.05) / w) * (dilimW / orijinal.width);
-            tumAdaylar.add(_AdayDaire(gx.clamp(0.0, 1.0), gy.clamp(0.0, 1.0), gr, val * doluluk));
+            tumAdaylar.add(_AdayDaire(gx.clamp(0.0, 1.0).toDouble(), gy.clamp(0.0, 1.0).toDouble(), gr, val * doluluk));
           }
         }
       }
@@ -1008,7 +1002,6 @@ class _KameraOlcumSayfasiState extends State<KameraOlcumSayfasi> {
     return tumAdaylar;
   }
 
-  /// ÖNCE TESPİT: Referans beklemeden tüm tomruk çemberlerini otomatik çıkarır
   Future<void> _otomatikTespitCalistir() async {
     if (_seciliFoto == null) return;
 
@@ -1030,7 +1023,6 @@ class _KameraOlcumSayfasiState extends State<KameraOlcumSayfasi> {
         hamAdaylar = hamAdaylar.where((a) => _roiNorm!.contains(Offset(a.x, a.y))).toList();
       }
 
-      // Kesin sıfır çakışma (d >= r1 + r2)
       hamAdaylar.sort((a, b) => b.skor.compareTo(a.skor));
       final List<_AdayDaire> secilenler = [];
       const double minRNorm = 0.010;
@@ -1091,8 +1083,8 @@ class _KameraOlcumSayfasiState extends State<KameraOlcumSayfasi> {
   void _seciliTomrukMerkezKaydir(double dxNorm, double dyNorm) {
     if (_seciliIdx == null || _seciliIdx! >= _tomruklar.length) return;
     final t = _tomruklar[_seciliIdx!];
-    final yeniX = (t.xNorm + dxNorm).clamp(0.01, 0.99);
-    final yeniY = (t.yNorm + dyNorm).clamp(0.01, 0.99);
+    final yeniX = (t.xNorm + dxNorm).clamp(0.01, 0.99).toDouble();
+    final yeniY = (t.yNorm + dyNorm).clamp(0.01, 0.99).toDouble();
     final maxR = _maksimumCakismasizYaricapNorm(yeniX, yeniY, haricIdx: _seciliIdx);
     if (t.capNorm / 2.0 > maxR) return;
 
@@ -1107,7 +1099,7 @@ class _KameraOlcumSayfasiState extends State<KameraOlcumSayfasi> {
     if (_seciliIdx == null || _seciliIdx! >= _tomruklar.length) return;
     final t = _tomruklar[_seciliIdx!];
     final maxR = _maksimumCakismasizYaricapNorm(t.xNorm, t.yNorm, haricIdx: _seciliIdx);
-    final hedef = yeniCapNorm.clamp(0.015, max(0.015, min(0.45, maxR * 2.0)));
+    final double hedef = yeniCapNorm.clamp(0.015, max(0.015, min(0.45, maxR * 2.0))).toDouble();
     setState(() {
       t.capNorm = hedef;
       _idwCaplariGuncelle();
@@ -1147,8 +1139,8 @@ class _KameraOlcumSayfasiState extends State<KameraOlcumSayfasi> {
   }
 
   void _fotoyaDokunuldu(TapDownDetails details, Size widgetSize) {
-    final nx = (details.localPosition.dx / widgetSize.width).clamp(0.0, 1.0);
-    final ny = (details.localPosition.dy / widgetSize.height).clamp(0.0, 1.0);
+    final nx = (details.localPosition.dx / widgetSize.width).clamp(0.0, 1.0).toDouble();
+    final ny = (details.localPosition.dy / widgetSize.height).clamp(0.0, 1.0).toDouble();
 
     if (_mod == EtkilesimModu.roiAlani) {
       setState(() {
@@ -1474,7 +1466,7 @@ class _KameraOlcumSayfasiState extends State<KameraOlcumSayfasi> {
                           ),
                           Expanded(
                             child: Slider(
-                              value: secili.capNorm.clamp(0.015, 0.45),
+                              value: secili.capNorm.clamp(0.015, 0.45).toDouble(),
                               min: 0.015,
                               max: 0.45,
                               onChanged: _seciliTomrukCemberBoyutuGuncelle,
@@ -1537,7 +1529,6 @@ class _KameraOlcumSayfasiState extends State<KameraOlcumSayfasi> {
               ),
             ),
           const SizedBox(height: 10),
-          // Çoklu Kare / Parçalı İstif Kontrolü
           if (_seciliFoto != null || _istifParcalari.isNotEmpty)
             Card(
               child: Padding(
