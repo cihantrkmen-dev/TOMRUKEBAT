@@ -767,7 +767,7 @@ class _LisansEkraniState extends State<LisansEkrani> {
 }
 
 // ====================================================================
-// 6. ANA ÖLÇÜM EKRANI (OTOMATİK ZOOM + ÇEMBER KENARINDAN ÇAP + ÇAKIŞMA KORUMASI)
+// 6. ANA ÖLÇÜM EKRANI (DİNAMİK MERKEZLİ ZOOM + 1 PARMAK MERKEZ / 2 PARMAK ÇAP)
 // ====================================================================
 class TespitEdilenTomruk {
   double xNorm;
@@ -794,7 +794,6 @@ class IstifParcasi {
 }
 
 enum EtkilesimModu { roiAlani, secDuzenle, tomrukEkle }
-enum _SuruklemeModu { yok, merkezTasi, capAyarla }
 
 class KameraOlcumSayfasi extends StatefulWidget {
   const KameraOlcumSayfasi({super.key});
@@ -820,7 +819,10 @@ class _KameraOlcumSayfasiState extends State<KameraOlcumSayfasi> {
   final List<TespitEdilenTomruk> _tomruklar = [];
   int? _seciliIdx;
   EtkilesimModu _mod = EtkilesimModu.secDuzenle;
-  _SuruklemeModu _suruklemeModu = _SuruklemeModu.yok;
+
+  // Tek parmak merkez taşıma & iki parmak çap ayarı durumu
+  Offset? _sonLocalFocalPoint;
+  double? _baslangicCapNorm;
 
   final TextEditingController _seciliRefCapCtrl = TextEditingController(text: '25');
   double _emvalBoyu = 3.0;
@@ -851,12 +853,13 @@ class _KameraOlcumSayfasiState extends State<KameraOlcumSayfasi> {
 
   void _zoomSifirla() => _zoomController.value = Matrix4.identity();
 
-  /// Seçilen veya yeni eklenen tomruğu ekranın ortasına 3x yakınlaştırır
-  void _tomrugaOdaklan(double nx, double ny, Size widgetSize, {double scale = 3.0}) {
+  /// Kenardakiler dahil seçilen/eklenen tomruğu dinamik ölçekle ekranın tam ortasına alır
+  void _tomrugaOdaklan(double nx, double ny, double capNorm, Size widgetSize) {
     final w = widgetSize.width;
     final h = widgetSize.height;
-    final double tx = (w / 2.0 - nx * w * scale).clamp(w * (1.0 - scale), 0.0).toDouble();
-    final double ty = (h / 2.0 - ny * h * scale).clamp(h * (1.0 - scale), 0.0).toDouble();
+    final double scale = (0.28 / max(0.04, capNorm)).clamp(2.5, 4.5).toDouble();
+    final double tx = w / 2.0 - nx * w * scale;
+    final double ty = h / 2.0 - ny * h * scale;
     _zoomController.value = Matrix4.identity()
       ..translate(tx, ty)
       ..scale(scale);
@@ -869,58 +872,44 @@ class _KameraOlcumSayfasiState extends State<KameraOlcumSayfasi> {
     }
   }
 
-  void _panBasladi(DragStartDetails details, Size widgetSize) {
-    if (_seciliIdx == null || _seciliIdx! >= _tomruklar.length) {
-      _suruklemeModu = _SuruklemeModu.yok;
-      return;
-    }
-    final t = _tomruklar[_seciliIdx!];
-    final centerPx = Offset(t.xNorm * widgetSize.width, t.yNorm * widgetSize.height);
-    final radiusPx = (t.capNorm * widgetSize.width) / 2.0;
-    final distFromCenter = (details.localPosition - centerPx).distance;
-
-    // Çemberin kenarına dokunulduysa çap ayarı, içine dokunulduysa merkez taşıma
-    final double edgeTol = max(9.0, radiusPx * 0.28);
-    if ((distFromCenter - radiusPx).abs() <= edgeTol) {
-      _suruklemeModu = _SuruklemeModu.capAyarla;
-    } else if (distFromCenter < radiusPx) {
-      _suruklemeModu = _SuruklemeModu.merkezTasi;
-    } else {
-      _suruklemeModu = _SuruklemeModu.yok;
-    }
+  void _scaleBasladi(ScaleStartDetails details, Size widgetSize) {
+    if (_seciliIdx == null || _seciliIdx! >= _tomruklar.length) return;
+    _sonLocalFocalPoint = details.localFocalPoint;
+    _baslangicCapNorm = _tomruklar[_seciliIdx!].capNorm;
   }
 
-  void _panGuncellendi(DragUpdateDetails details, Size widgetSize) {
-    if (_suruklemeModu == _SuruklemeModu.yok ||
-        _seciliIdx == null ||
-        _seciliIdx! >= _tomruklar.length) {
-      return;
-    }
+  void _scaleGuncellendi(ScaleUpdateDetails details, Size widgetSize) {
+    if (_seciliIdx == null || _seciliIdx! >= _tomruklar.length) return;
     final t = _tomruklar[_seciliIdx!];
+
     setState(() {
-      if (_suruklemeModu == _SuruklemeModu.merkezTasi) {
-        final yeniX = (t.xNorm + details.delta.dx / widgetSize.width).clamp(0.01, 0.99).toDouble();
-        final yeniY = (t.yNorm + details.delta.dy / widgetSize.height).clamp(0.01, 0.99).toDouble();
+      if (details.pointerCount >= 2 && _baslangicCapNorm != null) {
+        // İKİ PARMAK: Sadece seçili tomruğun çapını çakışma korumalı olarak ayarla
+        final maxR = _maksimumCakismasizYaricapNorm(t.xNorm, t.yNorm, haricIdx: _seciliIdx);
+        final double hedefCap = (_baslangicCapNorm! * details.scale)
+            .clamp(0.015, max(0.015, min(0.55, maxR * 2.0)))
+            .toDouble();
+        t.capNorm = hedefCap;
+      } else if (details.pointerCount == 1 && _sonLocalFocalPoint != null) {
+        // TEK PARMAK: Ekranın herhangi bir yerinden sürükleyerek merkezi çakışma korumalı taşı
+        final delta = details.localFocalPoint - _sonLocalFocalPoint!;
+        _sonLocalFocalPoint = details.localFocalPoint;
+
+        final yeniX = (t.xNorm + delta.dx / widgetSize.width).clamp(0.01, 0.99).toDouble();
+        final yeniY = (t.yNorm + delta.dy / widgetSize.height).clamp(0.01, 0.99).toDouble();
         final maxR = _maksimumCakismasizYaricapNorm(yeniX, yeniY, haricIdx: _seciliIdx);
         if (t.capNorm / 2.0 <= maxR) {
           t.xNorm = yeniX;
           t.yNorm = yeniY;
         }
-      } else if (_suruklemeModu == _SuruklemeModu.capAyarla) {
-        final centerPx = Offset(t.xNorm * widgetSize.width, t.yNorm * widgetSize.height);
-        final yeniYaricapPx = (details.localPosition - centerPx).distance;
-        final maxR = _maksimumCakismasizYaricapNorm(t.xNorm, t.yNorm, haricIdx: _seciliIdx);
-        final double hedefCap = ((yeniYaricapPx * 2.0) / widgetSize.width)
-            .clamp(0.015, max(0.015, min(0.55, maxR * 2.0)))
-            .toDouble();
-        t.capNorm = hedefCap;
       }
       _idwCaplariGuncelle();
     });
   }
 
-  void _panBitti(DragEndDetails details) {
-    _suruklemeModu = _SuruklemeModu.yok;
+  void _scaleBitti(ScaleEndDetails details) {
+    _sonLocalFocalPoint = null;
+    _baslangicCapNorm = null;
   }
 
   /// 1 ile 5 adet referans tomruğa göre Ters Mesafe Ağırlıklı Enterpolasyon (IDW)
@@ -1293,23 +1282,38 @@ class _KameraOlcumSayfasiState extends State<KameraOlcumSayfasi> {
         }
       });
     } else if (_mod == EtkilesimModu.secDuzenle) {
-      double minMesafe = 0.08;
       int? enYakinIdx;
-      for (int i = 0; i < _tomruklar.length; i++) {
-        final d = sqrt(pow(_tomruklar[i].xNorm - nx, 2) + pow((_tomruklar[i].yNorm - ny) * _invAspect, 2));
-        final esik = max(minMesafe, _tomruklar[i].capNorm / 2.0);
-        if (d < esik && d < minMesafe + 0.05) {
-          minMesafe = d;
-          enYakinIdx = i;
+      double enKucukMesafe = double.infinity;
+
+      if (_seciliIdx != null) {
+        // Zoom aktifken: sadece gerçek çemberin içine dokunulursa o komşuya geç, yoksa 1x'e dön
+        for (int i = 0; i < _tomruklar.length; i++) {
+          final d = sqrt(pow(_tomruklar[i].xNorm - nx, 2) + pow((_tomruklar[i].yNorm - ny) * _invAspect, 2));
+          final r = _tomruklar[i].capNorm / 2.0;
+          if (d <= r && d < enKucukMesafe) {
+            enKucukMesafe = d;
+            enYakinIdx = i;
+          }
+        }
+      } else {
+        // 1x normal görünümde: ince tomrukları kolay seçebilmek için geniş tolerans
+        for (int i = 0; i < _tomruklar.length; i++) {
+          final d = sqrt(pow(_tomruklar[i].xNorm - nx, 2) + pow((_tomruklar[i].yNorm - ny) * _invAspect, 2));
+          final esik = max(0.06, _tomruklar[i].capNorm / 2.0);
+          if (d <= esik && d < enKucukMesafe) {
+            enKucukMesafe = d;
+            enYakinIdx = i;
+          }
         }
       }
+
       setState(() {
         _seciliIdx = enYakinIdx;
         if (enYakinIdx != null) {
           final sel = _tomruklar[enYakinIdx];
           final gosterilecek = sel.referansCapCm ?? sel.capCm ?? 25.0;
           _seciliRefCapCtrl.text = gosterilecek.floor().toString();
-          _tomrugaOdaklan(sel.xNorm, sel.yNorm, widgetSize);
+          _tomrugaOdaklan(sel.xNorm, sel.yNorm, sel.capNorm, widgetSize);
         } else {
           _zoomSifirla();
         }
@@ -1334,7 +1338,7 @@ class _KameraOlcumSayfasiState extends State<KameraOlcumSayfasi> {
         _idwCaplariGuncelle();
         final sel = _tomruklar[_seciliIdx!];
         _seciliRefCapCtrl.text = (sel.capCm ?? 25.0).floor().toString();
-        _tomrugaOdaklan(sel.xNorm, sel.yNorm, widgetSize);
+        _tomrugaOdaklan(sel.xNorm, sel.yNorm, sel.capNorm, widgetSize);
       });
     }
   }
@@ -1486,7 +1490,6 @@ class _KameraOlcumSayfasiState extends State<KameraOlcumSayfasi> {
         ],
       ),
       body: ListView(
-        // Seçili tomruk varken ekranın aşağı-yukarı kaymasını engeller
         physics: parmakDuzenlemeAktif ? const NeverScrollableScrollPhysics() : null,
         padding: const EdgeInsets.all(12),
         children: [
@@ -1533,40 +1536,106 @@ class _KameraOlcumSayfasiState extends State<KameraOlcumSayfasi> {
                   builder: (context, constraints) {
                     final w = constraints.maxWidth;
                     final h = constraints.maxHeight;
-                    return InteractiveViewer(
-                      transformationController: _zoomController,
-                      panEnabled: !parmakDuzenlemeAktif,
-                      scaleEnabled: !parmakDuzenlemeAktif,
-                      minScale: 1.0,
-                      maxScale: 6.0,
-                      child: GestureDetector(
-                        onTapDown: (d) => _fotoyaDokunuldu(d, Size(w, h)),
-                        onPanStart: parmakDuzenlemeAktif
-                            ? (d) => _panBasladi(d, Size(w, h))
-                            : null,
-                        onPanUpdate: parmakDuzenlemeAktif
-                            ? (d) => _panGuncellendi(d, Size(w, h))
-                            : null,
-                        onPanEnd: parmakDuzenlemeAktif ? _panBitti : null,
-                        child: SizedBox(
-                          width: w,
-                          height: h,
-                          child: Stack(
-                            fit: StackFit.expand,
-                            children: [
-                              Image.file(_seciliFoto!, fit: BoxFit.fill),
-                              CustomPaint(
-                                painter: _OlcumOverlayPainter(
-                                  roiP1: _roiP1,
-                                  roiNorm: _roiNorm,
-                                  tomruklar: _tomruklar,
-                                  seciliIdx: _seciliIdx,
-                                ),
+                    return Stack(
+                      fit: StackFit.expand,
+                      children: [
+                        InteractiveViewer(
+                          transformationController: _zoomController,
+                          boundaryMargin: EdgeInsets.symmetric(horizontal: w, vertical: h),
+                          panEnabled: !parmakDuzenlemeAktif,
+                          scaleEnabled: !parmakDuzenlemeAktif,
+                          minScale: 1.0,
+                          maxScale: 6.0,
+                          child: GestureDetector(
+                            behavior: HitTestBehavior.opaque,
+                            onTapDown: (d) => _fotoyaDokunuldu(d, Size(w, h)),
+                            onScaleStart: parmakDuzenlemeAktif
+                                ? (d) => _scaleBasladi(d, Size(w, h))
+                                : null,
+                            onScaleUpdate: parmakDuzenlemeAktif
+                                ? (d) => _scaleGuncellendi(d, Size(w, h))
+                                : null,
+                            onScaleEnd: parmakDuzenlemeAktif ? _scaleBitti : null,
+                            child: SizedBox(
+                              width: w,
+                              height: h,
+                              child: Stack(
+                                fit: StackFit.expand,
+                                children: [
+                                  Image.file(_seciliFoto!, fit: BoxFit.fill),
+                                  CustomPaint(
+                                    painter: _OlcumOverlayPainter(
+                                      roiP1: _roiP1,
+                                      roiNorm: _roiNorm,
+                                      tomruklar: _tomruklar,
+                                      seciliIdx: _seciliIdx,
+                                    ),
+                                  ),
+                                ],
                               ),
-                            ],
+                            ),
                           ),
                         ),
-                      ),
+                        if (parmakDuzenlemeAktif)
+                          Positioned(
+                            top: 8,
+                            right: 8,
+                            child: Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                Material(
+                                  color: Colors.red.shade700,
+                                  borderRadius: BorderRadius.circular(20),
+                                  elevation: 4,
+                                  child: InkWell(
+                                    borderRadius: BorderRadius.circular(20),
+                                    onTap: () => setState(() {
+                                      _tomruklar.removeAt(_seciliIdx!);
+                                      _seciliIdx = null;
+                                      _zoomSifirla();
+                                      _idwCaplariGuncelle();
+                                    }),
+                                    child: const Padding(
+                                      padding: EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                                      child: Icon(Icons.delete, color: Colors.white, size: 18),
+                                    ),
+                                  ),
+                                ),
+                                const SizedBox(width: 6),
+                                Material(
+                                  color: const Color(0xFF2E5A27),
+                                  borderRadius: BorderRadius.circular(20),
+                                  elevation: 4,
+                                  child: InkWell(
+                                    borderRadius: BorderRadius.circular(20),
+                                    onTap: () {
+                                      setState(() => _seciliIdx = null);
+                                      _zoomSifirla();
+                                    },
+                                    child: const Padding(
+                                      padding: EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                                      child: Row(
+                                        mainAxisSize: MainAxisSize.min,
+                                        children: [
+                                          Icon(Icons.check, color: Colors.white, size: 18),
+                                          SizedBox(width: 4),
+                                          Text(
+                                            'Tamam',
+                                            style: TextStyle(
+                                              color: Colors.white,
+                                              fontWeight: FontWeight.bold,
+                                              fontSize: 13,
+                                            ),
+                                          ),
+                                        ],
+                                      ),
+                                    ),
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                      ],
                     );
                   },
                 ),
@@ -1606,9 +1675,10 @@ class _KameraOlcumSayfasiState extends State<KameraOlcumSayfasi> {
                                 ? 'REFERANS TOMRUK (${secili.referansCapCm!.floor()} cm)'
                                 : secili.capCm != null
                                     ? 'Seçili Çap: ${secili.capCm!.floor()} cm (Ham: ${secili.capCm!.toStringAsFixed(1)})'
-                                    : 'Seçili Tomruk (Referans bekleniyor)',
+                                    : 'Seçili Tomruk (1 parmak: merkez | 2 parmak: çap)',
                             style: TextStyle(
                               fontWeight: FontWeight.bold,
+                              fontSize: 12,
                               color: secili.isReferans ? Colors.red.shade800 : null,
                             ),
                           ),
