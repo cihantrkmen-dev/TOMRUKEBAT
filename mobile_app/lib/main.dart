@@ -797,6 +797,7 @@ class IstifParcasi {
 }
 
 enum EtkilesimModu { roiAlani, secDuzenle, tomrukEkle }
+enum _SuruklemeModu { yok, merkezTasi, capAyarla }
 
 class KameraOlcumSayfasi extends StatefulWidget {
   const KameraOlcumSayfasi({super.key});
@@ -822,6 +823,7 @@ class _KameraOlcumSayfasiState extends State<KameraOlcumSayfasi> {
   final List<TespitEdilenTomruk> _tomruklar = [];
   int? _seciliIdx;
   EtkilesimModu _mod = EtkilesimModu.secDuzenle;
+  _SuruklemeModu _suruklemeModu = _SuruklemeModu.yok;
 
   final TextEditingController _seciliRefCapCtrl = TextEditingController(text: '25');
   double _emvalBoyu = 3.0;
@@ -857,6 +859,54 @@ class _KameraOlcumSayfasiState extends State<KameraOlcumSayfasi> {
     if (girilen != null && girilen > 0 && girilen <= 30.0) {
       setState(() => _emvalBoyu = girilen);
     }
+  }
+
+  void _panBasladi(DragStartDetails details, Size widgetSize) {
+    if (_mod != EtkilesimModu.secDuzenle ||
+        _seciliIdx == null ||
+        _seciliIdx! >= _tomruklar.length) {
+      _suruklemeModu = _SuruklemeModu.yok;
+      return;
+    }
+    final t = _tomruklar[_seciliIdx!];
+    final centerPx = Offset(t.xNorm * widgetSize.width, t.yNorm * widgetSize.height);
+    final radiusPx = (t.capNorm * widgetSize.width) / 2.0;
+    final handlePx = Offset(centerPx.dx + radiusPx, centerPx.dy);
+
+    final distHandle = (details.localPosition - handlePx).distance;
+    final distCenter = (details.localPosition - centerPx).distance;
+
+    if (distHandle <= max(26.0, radiusPx * 0.35)) {
+      _suruklemeModu = _SuruklemeModu.capAyarla;
+    } else if (distCenter <= max(24.0, radiusPx)) {
+      _suruklemeModu = _SuruklemeModu.merkezTasi;
+    } else {
+      _suruklemeModu = _SuruklemeModu.yok;
+    }
+  }
+
+  void _panGuncellendi(DragUpdateDetails details, Size widgetSize) {
+    if (_suruklemeModu == _SuruklemeModu.yok ||
+        _seciliIdx == null ||
+        _seciliIdx! >= _tomruklar.length) {
+      return;
+    }
+    final t = _tomruklar[_seciliIdx!];
+    setState(() {
+      if (_suruklemeModu == _SuruklemeModu.merkezTasi) {
+        t.xNorm = (t.xNorm + details.delta.dx / widgetSize.width).clamp(0.01, 0.99).toDouble();
+        t.yNorm = (t.yNorm + details.delta.dy / widgetSize.height).clamp(0.01, 0.99).toDouble();
+      } else if (_suruklemeModu == _SuruklemeModu.capAyarla) {
+        final centerPx = Offset(t.xNorm * widgetSize.width, t.yNorm * widgetSize.height);
+        final yeniYaricapPx = (details.localPosition - centerPx).distance;
+        t.capNorm = ((yeniYaricapPx * 2.0) / widgetSize.width).clamp(0.015, 0.55).toDouble();
+      }
+      _idwCaplariGuncelle();
+    });
+  }
+
+  void _panBitti(DragEndDetails details) {
+    _suruklemeModu = _SuruklemeModu.yok;
   }
 
   /// 1 ile 5 adet referans tomruğa göre Ters Mesafe Ağırlıklı Enterpolasyon (IDW)
@@ -1373,6 +1423,7 @@ class _KameraOlcumSayfasiState extends State<KameraOlcumSayfasi> {
     final kalin = genelCaplar.where((c) => c >= 30).length;
 
     final secili = (_seciliIdx != null && _seciliIdx! < _tomruklar.length) ? _tomruklar[_seciliIdx!] : null;
+    final bool parmakDuzenlemeAktif = _mod == EtkilesimModu.secDuzenle && secili != null;
 
     return Scaffold(
       appBar: AppBar(
@@ -1458,10 +1509,18 @@ class _KameraOlcumSayfasiState extends State<KameraOlcumSayfasi> {
                     final h = constraints.maxHeight;
                     return InteractiveViewer(
                       transformationController: _zoomController,
+                      panEnabled: !parmakDuzenlemeAktif,
                       minScale: 1.0,
                       maxScale: 6.0,
                       child: GestureDetector(
                         onTapDown: (d) => _fotoyaDokunuldu(d, Size(w, h)),
+                        onPanStart: parmakDuzenlemeAktif
+                            ? (d) => _panBasladi(d, Size(w, h))
+                            : null,
+                        onPanUpdate: parmakDuzenlemeAktif
+                            ? (d) => _panGuncellendi(d, Size(w, h))
+                            : null,
+                        onPanEnd: parmakDuzenlemeAktif ? _panBitti : null,
                         child: SizedBox(
                           width: w,
                           height: h,
@@ -1755,6 +1814,19 @@ class _OlcumOverlayPainter extends CustomPainter {
           ..strokeWidth = (isSelected || t.isReferans) ? 3.0 : 1.8
           ..style = PaintingStyle.stroke,
       );
+
+      if (isSelected) {
+        final handlePos = Offset(center.dx + radius, center.dy);
+        canvas.drawCircle(handlePos, 7.5, Paint()..color = Colors.amberAccent);
+        canvas.drawCircle(
+          handlePos,
+          7.5,
+          Paint()
+            ..color = Colors.black
+            ..strokeWidth = 2.0
+            ..style = PaintingStyle.stroke,
+        );
+      }
 
       final String etiket = t.isReferans
           ? 'R ${t.referansCapCm!.floor()}'
