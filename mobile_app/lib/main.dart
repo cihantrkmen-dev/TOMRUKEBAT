@@ -272,7 +272,6 @@ class YoloTfliteServisi {
       final List<_AdayDaire> adaylar = [];
       double enYuksekSkor = 0.0;
 
-      // Yeni end-to-end / NMS'li çıktı formatı: [1, 300, 6] -> [x1, y1, x2, y2, conf, cls]
       if (dim2 == 6 && dim1 > 6) {
         for (int i = 0; i < dim1; i++) {
           final double conf = output[0][i][4];
@@ -297,7 +296,6 @@ class YoloTfliteServisi {
           }
         }
       } else {
-        // Klasik YOLOv8 çıktısı: [1, 5, 8400] veya [1, 8400, 5]
         final bool kanalOnce = dim1 < dim2;
         final int kutuSayisi = kanalOnce ? dim2 : dim1;
         final int ozellikSayisi = kanalOnce ? dim1 : dim2;
@@ -343,7 +341,6 @@ class YoloTfliteServisi {
     }
   }
 
-  /// Uzun istifler için %20 örtüşmeli otomatik yatay dilimleme + tam kare birleştirme
   List<_AdayDaire> dilimliTespitEt(img.Image orijinal, {double confEsik = 0.15}) {
     final List<_AdayDaire> tumu = [];
     tumu.addAll(_tekKareTespit(orijinal, confEsik: confEsik));
@@ -770,7 +767,7 @@ class _LisansEkraniState extends State<LisansEkrani> {
 }
 
 // ====================================================================
-// 6. ANA ÖLÇÜM EKRANI (ÖNCE TESPİT -> 1-5 REF IDW + PARÇALI İSTİF + PDF)
+// 6. ANA ÖLÇÜM EKRANI (OTOMATİK ZOOM + ÇEMBER KENARINDAN ÇAP + ÇAKIŞMA KORUMASI)
 // ====================================================================
 class TespitEdilenTomruk {
   double xNorm;
@@ -854,6 +851,17 @@ class _KameraOlcumSayfasiState extends State<KameraOlcumSayfasi> {
 
   void _zoomSifirla() => _zoomController.value = Matrix4.identity();
 
+  /// Seçilen veya yeni eklenen tomruğu ekranın ortasına 3x yakınlaştırır
+  void _tomrugaOdaklan(double nx, double ny, Size widgetSize, {double scale = 3.0}) {
+    final w = widgetSize.width;
+    final h = widgetSize.height;
+    final double tx = (w / 2.0 - nx * w * scale).clamp(w * (1.0 - scale), 0.0).toDouble();
+    final double ty = (h / 2.0 - ny * h * scale).clamp(h * (1.0 - scale), 0.0).toDouble();
+    _zoomController.value = Matrix4.identity()
+      ..translate(tx, ty)
+      ..scale(scale);
+  }
+
   void _emvalBoyuDegisti(String val) {
     final girilen = double.tryParse(val.replaceAll(',', '.'));
     if (girilen != null && girilen > 0 && girilen <= 30.0) {
@@ -862,23 +870,20 @@ class _KameraOlcumSayfasiState extends State<KameraOlcumSayfasi> {
   }
 
   void _panBasladi(DragStartDetails details, Size widgetSize) {
-    if (_mod != EtkilesimModu.secDuzenle ||
-        _seciliIdx == null ||
-        _seciliIdx! >= _tomruklar.length) {
+    if (_seciliIdx == null || _seciliIdx! >= _tomruklar.length) {
       _suruklemeModu = _SuruklemeModu.yok;
       return;
     }
     final t = _tomruklar[_seciliIdx!];
     final centerPx = Offset(t.xNorm * widgetSize.width, t.yNorm * widgetSize.height);
     final radiusPx = (t.capNorm * widgetSize.width) / 2.0;
-    final handlePx = Offset(centerPx.dx + radiusPx, centerPx.dy);
+    final distFromCenter = (details.localPosition - centerPx).distance;
 
-    final distHandle = (details.localPosition - handlePx).distance;
-    final distCenter = (details.localPosition - centerPx).distance;
-
-    if (distHandle <= max(26.0, radiusPx * 0.35)) {
+    // Çemberin kenarına dokunulduysa çap ayarı, içine dokunulduysa merkez taşıma
+    final double edgeTol = max(9.0, radiusPx * 0.28);
+    if ((distFromCenter - radiusPx).abs() <= edgeTol) {
       _suruklemeModu = _SuruklemeModu.capAyarla;
-    } else if (distCenter <= max(24.0, radiusPx)) {
+    } else if (distFromCenter < radiusPx) {
       _suruklemeModu = _SuruklemeModu.merkezTasi;
     } else {
       _suruklemeModu = _SuruklemeModu.yok;
@@ -894,12 +899,21 @@ class _KameraOlcumSayfasiState extends State<KameraOlcumSayfasi> {
     final t = _tomruklar[_seciliIdx!];
     setState(() {
       if (_suruklemeModu == _SuruklemeModu.merkezTasi) {
-        t.xNorm = (t.xNorm + details.delta.dx / widgetSize.width).clamp(0.01, 0.99).toDouble();
-        t.yNorm = (t.yNorm + details.delta.dy / widgetSize.height).clamp(0.01, 0.99).toDouble();
+        final yeniX = (t.xNorm + details.delta.dx / widgetSize.width).clamp(0.01, 0.99).toDouble();
+        final yeniY = (t.yNorm + details.delta.dy / widgetSize.height).clamp(0.01, 0.99).toDouble();
+        final maxR = _maksimumCakismasizYaricapNorm(yeniX, yeniY, haricIdx: _seciliIdx);
+        if (t.capNorm / 2.0 <= maxR) {
+          t.xNorm = yeniX;
+          t.yNorm = yeniY;
+        }
       } else if (_suruklemeModu == _SuruklemeModu.capAyarla) {
         final centerPx = Offset(t.xNorm * widgetSize.width, t.yNorm * widgetSize.height);
         final yeniYaricapPx = (details.localPosition - centerPx).distance;
-        t.capNorm = ((yeniYaricapPx * 2.0) / widgetSize.width).clamp(0.015, 0.55).toDouble();
+        final maxR = _maksimumCakismasizYaricapNorm(t.xNorm, t.yNorm, haricIdx: _seciliIdx);
+        final double hedefCap = ((yeniYaricapPx * 2.0) / widgetSize.width)
+            .clamp(0.015, max(0.015, min(0.55, maxR * 2.0)))
+            .toDouble();
+        t.capNorm = hedefCap;
       }
       _idwCaplariGuncelle();
     });
@@ -1127,6 +1141,7 @@ class _KameraOlcumSayfasiState extends State<KameraOlcumSayfasi> {
   Future<void> _otomatikTespitCalistir() async {
     if (_seciliFoto == null) return;
 
+    _zoomSifirla();
     setState(() {
       _isleniyor = true;
       _seciliIdx = null;
@@ -1194,7 +1209,7 @@ class _KameraOlcumSayfasiState extends State<KameraOlcumSayfasi> {
             : '';
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
-            duration: const Duration(seconds: 8),
+            duration: const Duration(seconds: 6),
             content: Text(
               '[$motor] ${bulunanlar.length} tomruk bulundu.$ek',
             ),
@@ -1282,7 +1297,8 @@ class _KameraOlcumSayfasiState extends State<KameraOlcumSayfasi> {
       int? enYakinIdx;
       for (int i = 0; i < _tomruklar.length; i++) {
         final d = sqrt(pow(_tomruklar[i].xNorm - nx, 2) + pow((_tomruklar[i].yNorm - ny) * _invAspect, 2));
-        if (d < minMesafe) {
+        final esik = max(minMesafe, _tomruklar[i].capNorm / 2.0);
+        if (d < esik && d < minMesafe + 0.05) {
           minMesafe = d;
           enYakinIdx = i;
         }
@@ -1293,6 +1309,9 @@ class _KameraOlcumSayfasiState extends State<KameraOlcumSayfasi> {
           final sel = _tomruklar[enYakinIdx];
           final gosterilecek = sel.referansCapCm ?? sel.capCm ?? 25.0;
           _seciliRefCapCtrl.text = gosterilecek.floor().toString();
+          _tomrugaOdaklan(sel.xNorm, sel.yNorm, widgetSize);
+        } else {
+          _zoomSifirla();
         }
       });
     } else if (_mod == EtkilesimModu.tomrukEkle) {
@@ -1315,6 +1334,7 @@ class _KameraOlcumSayfasiState extends State<KameraOlcumSayfasi> {
         _idwCaplariGuncelle();
         final sel = _tomruklar[_seciliIdx!];
         _seciliRefCapCtrl.text = (sel.capCm ?? 25.0).floor().toString();
+        _tomrugaOdaklan(sel.xNorm, sel.yNorm, widgetSize);
       });
     }
   }
@@ -1423,7 +1443,8 @@ class _KameraOlcumSayfasiState extends State<KameraOlcumSayfasi> {
     final kalin = genelCaplar.where((c) => c >= 30).length;
 
     final secili = (_seciliIdx != null && _seciliIdx! < _tomruklar.length) ? _tomruklar[_seciliIdx!] : null;
-    final bool parmakDuzenlemeAktif = _mod == EtkilesimModu.secDuzenle && secili != null;
+    final bool parmakDuzenlemeAktif =
+        (_mod == EtkilesimModu.secDuzenle || _mod == EtkilesimModu.tomrukEkle) && secili != null;
 
     return Scaffold(
       appBar: AppBar(
@@ -1457,11 +1478,16 @@ class _KameraOlcumSayfasiState extends State<KameraOlcumSayfasi> {
             IconButton(
               tooltip: 'Yakınlaştırmayı Sıfırla',
               icon: const Icon(Icons.zoom_out_map),
-              onPressed: _zoomSifirla,
+              onPressed: () {
+                setState(() => _seciliIdx = null);
+                _zoomSifirla();
+              },
             ),
         ],
       ),
       body: ListView(
+        // Seçili tomruk varken ekranın aşağı-yukarı kaymasını engeller
+        physics: parmakDuzenlemeAktif ? const NeverScrollableScrollPhysics() : null,
         padding: const EdgeInsets.all(12),
         children: [
           Row(
@@ -1510,6 +1536,7 @@ class _KameraOlcumSayfasiState extends State<KameraOlcumSayfasi> {
                     return InteractiveViewer(
                       transformationController: _zoomController,
                       panEnabled: !parmakDuzenlemeAktif,
+                      scaleEnabled: !parmakDuzenlemeAktif,
                       minScale: 1.0,
                       maxScale: 6.0,
                       child: GestureDetector(
@@ -1553,7 +1580,13 @@ class _KameraOlcumSayfasiState extends State<KameraOlcumSayfasi> {
                 ButtonSegment(value: EtkilesimModu.tomrukEkle, label: Text('3. Ekle')),
               ],
               selected: {_mod},
-              onSelectionChanged: (s) => setState(() => _mod = s.first),
+              onSelectionChanged: (s) => setState(() {
+                _mod = s.first;
+                if (_mod == EtkilesimModu.roiAlani) {
+                  _seciliIdx = null;
+                  _zoomSifirla();
+                }
+              }),
             ),
             if (secili != null) ...[
               const SizedBox(height: 8),
@@ -1585,6 +1618,7 @@ class _KameraOlcumSayfasiState extends State<KameraOlcumSayfasi> {
                             onPressed: () => setState(() {
                               _tomruklar.removeAt(_seciliIdx!);
                               _seciliIdx = null;
+                              _zoomSifirla();
                               _idwCaplariGuncelle();
                             }),
                           ),
@@ -1811,22 +1845,9 @@ class _OlcumOverlayPainter extends CustomPainter {
         radius,
         Paint()
           ..color = renk
-          ..strokeWidth = (isSelected || t.isReferans) ? 3.0 : 1.8
+          ..strokeWidth = (isSelected || t.isReferans) ? 3.2 : 1.8
           ..style = PaintingStyle.stroke,
       );
-
-      if (isSelected) {
-        final handlePos = Offset(center.dx + radius, center.dy);
-        canvas.drawCircle(handlePos, 7.5, Paint()..color = Colors.amberAccent);
-        canvas.drawCircle(
-          handlePos,
-          7.5,
-          Paint()
-            ..color = Colors.black
-            ..strokeWidth = 2.0
-            ..style = PaintingStyle.stroke,
-        );
-      }
 
       final String etiket = t.isReferans
           ? 'R ${t.referansCapCm!.floor()}'
